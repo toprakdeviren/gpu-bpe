@@ -94,4 +94,4 @@ MIT
 
 ## Author
 
-[Toprak Deviren](https://github.com/toprakdeviren)
+[Uğur Toprakdeviren](https://github.com/toprakdeviren)
