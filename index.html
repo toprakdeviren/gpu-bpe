@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="tr">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BPE Tokenizer · WebGPU LLM Workbench</title>
+    <meta name="description" content="Train tokenizers with GPU-native Byte Pair Encoding on WebGPU compute shaders.">
+
+    <link rel="stylesheet" href="src/styles.css">
+</head>
+
+<body>
+    <!-- Header -->
+    <header>
+        <div class="container">
+            <div class="header-content">
+                <div class="header-left">
+                    <div class="logo">
+                        <span class="logo-text">Decoder</span>
+                        <span class="logo-badge">· WebGPU</span>
+                    </div>
+                    <nav class="tab-nav">
+                        <button class="tab-btn active" data-tab="train">Train</button>
+                        <button class="tab-btn" data-tab="tokenizer">Tokenizer</button>
+                    </nav>
+                </div>
+                <div class="status-bar">
+                    <div id="statusDot" class="status-dot"></div>
+                    <span id="statusText" class="status-text"></span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main -->
+    <main class="grid-bg">
+        <div class="container">
+            <!-- ═══ TRAIN TAB ═══ -->
+            <div class="tab-content active" data-tab="train">
+                <div class="content-wrapper">
+                    <!-- Hero -->
+                    <div class="hero">
+                        <h1>Train a tokenizer</h1>
+                        <p>
+                            GPU-native Byte Pair Encoding on WebGPU compute shaders. Drop your text files,
+                            pick a vocabulary size, and train — everything runs on your GPU.
+                        </p>
+                    </div>
+
+                    <!-- File Upload -->
+                    <section>
+                        <label class="section-label">Training Data</label>
+                        <div id="dropZone" class="drop-zone">
+                            <input type="file" id="fileInput" multiple
+                                accept=".txt,.md,.json,.csv,.tsv,.xml,.html,.py,.swift,.js,.rs,.c,.h,.go,.java,.kt">
+                            <input type="file" id="folderInput" webkitdirectory class="hidden">
+                            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                                    d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m6.75 12l-3-3m0 0l-3 3m3-3v6m-1.5-15H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+                            </svg>
+                            <div class="drop-zone-text">Drop files here or <span class="highlight">browse</span></div>
+                            <div class="drop-zone-hint">Multiple files OK · <span id="browseFolder" class="highlight"
+                                    style="cursor:pointer">browse folder</span> for recursive scan</div>
+                        </div>
+                        <div id="fileProcessing" class="file-processing hidden">
+                            <div class="processing-dot"></div>
+                            <span id="fileProcessingText">Processing files…</span>
+                        </div>
+                        <div id="fileList" class="file-list"></div>
+                        <div id="fileSummary" class="file-summary hidden">
+                            <span id="fileTotalInfo" class="file-total"></span>
+                            <label class="shuffle-label">
+                                <input type="checkbox" id="shuffleToggle" checked>
+                                <span>Shuffle paragraphs</span>
+                            </label>
+                        </div>
+                    </section>
+
+                    <!-- Vocab Size -->
+                    <section>
+                        <label class="section-label">Vocabulary Size</label>
+                        <div class="vocab-chips">
+                            <button class="vocab-chip" data-value="512">512</button>
+                            <button class="vocab-chip" data-value="1024">1K</button>
+                            <button class="vocab-chip" data-value="2048">2K</button>
+                            <button class="vocab-chip" data-value="4096">4K</button>
+                            <button class="vocab-chip" data-value="8192">8K</button>
+                            <button class="vocab-chip" data-value="16384">16K</button>
+                            <button class="vocab-chip" data-value="32768">32K</button>
+                            <button class="vocab-chip active" data-value="65536">64K</button>
+                        </div>
+                    </section>
+
+                    <!-- Actions -->
+                    <section class="section-gap">
+                        <button id="trainBtn" class="btn btn-primary" disabled>
+                            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z" />
+                            </svg>
+                            Train BPE
+                        </button>
+                        <div id="progressWrap" class="progress-wrap hidden">
+                            <div class="progress-header">
+                                <span id="progressLabel" class="progress-label">Training…</span>
+                                <span id="progressEta" class="progress-eta"></span>
+                                <span id="progressRate" class="progress-rate"></span>
+                            </div>
+                            <div class="progress-bar">
+                                <div id="progressFill" class="progress-fill"></div>
+                            </div>
+                        </div>
+                        <button id="downloadBtn" class="btn btn-secondary hidden">
+                            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+                            </svg>
+                            <span>Download Vocabulary</span>
+                        </button>
+                    </section>
+
+                    <!-- Log Output -->
+                    <section>
+                        <label class="section-label">Output Log</label>
+                        <div id="log" class="log-output"></div>
+                    </section>
+                </div>
+            </div>
+
+            <!-- ═══ TOKENIZER TAB ═══ -->
+            <div class="tab-content" data-tab="tokenizer">
+                <div class="content-wrapper">
+                    <!-- Hero -->
+                    <div class="hero">
+                        <h1>Tokenize text</h1>
+                        <p>
+                            Load a trained vocabulary or train one first, then encode text
+                            into BPE tokens to see compression in action.
+                        </p>
+                    </div>
+
+                    <!-- Load Vocab -->
+                    <section>
+                        <label class="section-label">Vocabulary</label>
+                        <div id="vocabStatus" class="vocab-status">
+                            <div class="vocab-status-icon" id="vocabStatusIcon">
+                                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                        d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+                                </svg>
+                            </div>
+                            <span id="vocabStatusText">No vocabulary loaded</span>
+                        </div>
+                        <div class="vocab-actions">
+                            <button id="loadVocabBtn" class="btn btn-secondary">
+                                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                        d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
+                                </svg>
+                                <span>Load Vocabulary (.json)</span>
+                            </button>
+                            <input type="file" id="vocabFileInput" accept=".json" class="hidden">
+                        </div>
+                    </section>
+
+                    <!-- Encode Section -->
+                    <section id="tokenizerSection" class="hidden">
+                        <label class="section-label">Tokenize</label>
+                        <div class="tokenizer-container">
+                            <textarea id="tokenizerInput" class="tokenizer-input" placeholder="Type or paste text here…"
+                                rows="4"></textarea>
+                            <div class="tokenizer-actions">
+                                <button id="encodeBtn" class="btn btn-secondary">
+                                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                            d="M13 10V3L4 14h7v7l9-11h-7z" />
+                                    </svg>
+                                    <span>Tokenize</span>
+                                </button>
+                                <div class="tokenizer-stats">
+                                    <span id="tokenCount" class="stat-badge">0 tokens</span>
+                                    <span id="compressionRatio" class="stat-badge">—</span>
+                                </div>
+                            </div>
+                            <div id="tokenizerOutput" class="tokenizer-output hidden"></div>
+                        </div>
+                    </section>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer>
+        <div class="container">
+            <div class="footer-content">
+                <span>Decoder · LLM Workbench</span>
+                <span>WebGPU Compute</span>
+            </div>
+        </div>
+    </footer>
+
+    <script type="module" src="src/app.js"></script>
+</body>
+
+</html>
