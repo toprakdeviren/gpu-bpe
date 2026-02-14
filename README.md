@@ -46,7 +46,7 @@ index.html ─── app.js
 
 ### Pre-tokenization (WASM)
 
-The WASM layer ([Decoder](https://github.com/nicktoprak/decoder)) provides full Unicode 17.0 property tables. The `PreTokenizer` classifies codepoints into character classes (letter, digit, whitespace, punctuation, symbol, newline) and applies GPT-4 style boundary rules at the codepoint level — before the byte stream reaches the GPU. This solves the multi-byte punctuation merging problem where byte-level heuristics cannot distinguish continuation bytes of letters from continuation bytes of punctuation.
+The WASM layer (Decoder) provides full Unicode 17.0 property tables. The `PreTokenizer` classifies codepoints into character classes (letter, digit, whitespace, punctuation, symbol, newline) and applies GPT-4 style boundary rules at the codepoint level — before the byte stream reaches the GPU. This solves the multi-byte punctuation merging problem where byte-level heuristics cannot distinguish continuation bytes of letters from continuation bytes of punctuation.
 
 ## Usage
 
