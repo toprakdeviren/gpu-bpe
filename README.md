@@ -80,18 +80,7 @@ After training, switch to the Tokenizer tab. Type or paste text to see the token
 
 You can also load a pre-trained vocabulary (JSON merge list) via the "Load Vocab" button without retraining.
 
-## File Structure
-
-Production build compresses to 3 files:
-
-```
-dist/
-  index.html      ~226 KB   (JS + CSS + fonts inlined)
-  decoder.wasm    ~449 KB   (Unicode 17.0 tables)
-  bpe.wgsl         ~37 KB   (GPU kernels)
-```
-
-No dependencies. No build step required for development.
+No dependencies. No build step required.
 
 ## Browser Requirements
 
