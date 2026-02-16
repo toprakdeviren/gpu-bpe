@@ -8,7 +8,7 @@
 // ─── Constants ──────────────────────────────────────────────
 
 export const WORKGROUP_SIZE = 256;
-export const TABLE_SIZE = 2_097_143;      // prime near 2M (same as Metal)
+export const TABLE_SIZE = 2_097_152;      // 2^21 — power-of-2 for bitwise AND modulo
 export const INVALID_TOKEN = 0xFFFF_FFFF;
 export const MAX_WG_DIM = 65_535;         // WebGPU max workgroups per dimension
 
@@ -88,6 +88,7 @@ function splitKernels(source) {
  */
 async function loadShaderSource(baseUrl) {
     const url = new URL(SHADER_PATH, baseUrl);
+    url.searchParams.set('v', Date.now());   // cache-bust
 
     try {
         const response = await fetch(url);
@@ -107,15 +108,23 @@ async function loadShaderSource(baseUrl) {
  *
  * @param {GPUDevice} device
  * @param {Record<string, string>} kernelSources
- * @returns {Record<string, GPUComputePipeline>}
+ * @returns {Promise<Record<string, GPUComputePipeline>>}
  */
-function compilePipelines(device, kernelSources) {
+async function compilePipelines(device, kernelSources) {
     const pipelines = {};
 
     for (const [name, code] of Object.entries(kernelSources)) {
         const module = device.createShaderModule({ code, label: name });
 
-        pipelines[name] = device.createComputePipeline({
+        // Check for compilation errors before creating pipeline
+        const info = await module.getCompilationInfo();
+        for (const msg of info.messages) {
+            if (msg.type === 'error') {
+                console.error(`[WGSL] ${name}:${msg.lineNum}:${msg.linePos} ${msg.message}`);
+            }
+        }
+
+        pipelines[name] = await device.createComputePipelineAsync({
             label: name,
             layout: 'auto',
             compute: { module, entryPoint: name },
@@ -187,7 +196,7 @@ export class BPEEngine {
 
         const shaderSource = await loadShaderSource(import.meta.url);
         const kernelSources = splitKernels(shaderSource);
-        this.#pipelines = compilePipelines(this.#device, kernelSources);
+        this.#pipelines = await compilePipelines(this.#device, kernelSources);
 
         this.#initialized = true;
 

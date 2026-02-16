@@ -8,6 +8,7 @@ import { TokenizerManager } from '../bpe/tokenizer-manager.js';
 import { FileInputController } from './file-input-controller.js';
 import { VocabLoaderController } from './vocab-loader-controller.js';
 import { EncoderController } from './encoder-controller.js';
+import { ExportController } from './export-controller.js';
 
 // ─── Application Class ───
 export class BPETokenizerApp {
@@ -29,6 +30,10 @@ export class BPETokenizerApp {
         this.encoder = new EncoderController(
             this.logger, () => this.tokenizerManager
         );
+        this.bpeEngine = null;
+        this.exportController = new ExportController(
+            this.logger, () => this.trainingManager, () => this.bpeEngine
+        );
     }
 
     initialize() {
@@ -36,6 +41,7 @@ export class BPETokenizerApp {
         this.fileInput.bind();
         this.vocabLoader.bind();
         this.encoder.bind();
+        this.exportController.bind();
 
         $('trainBtn').addEventListener('click', async () => {
             if (this.trainingManager) await this.trainingManager.startTraining();
@@ -48,8 +54,10 @@ export class BPETokenizerApp {
     }
 
     setBPEEngine(engine, preTokenizer = null) {
+        this.bpeEngine = engine;
         this.trainingManager = new TrainingManager(
-            engine, this.fileManager, this.uiManager, this.logger, preTokenizer
+            engine, this.fileManager, this.uiManager, this.logger, preTokenizer,
+            (vocabSize) => this.exportController.notifyTrainingComplete(vocabSize)
         );
         this.tokenizerManager = new TokenizerManager(
             engine, this.trainingManager, this.logger

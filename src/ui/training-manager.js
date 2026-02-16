@@ -3,7 +3,7 @@ import { BPETrainer } from '../bpe/trainer.js';
 
 // ─── Training Manager Class ───
 export class TrainingManager {
-    constructor(bpeEngine, fileManager, uiManager, logger, preTokenizer = null) {
+    constructor(bpeEngine, fileManager, uiManager, logger, preTokenizer = null, onTrainingComplete = null) {
         this.bpeEngine = bpeEngine;
         this.fileManager = fileManager;
         this.uiManager = uiManager;
@@ -11,6 +11,11 @@ export class TrainingManager {
         this.lastTrainer = null;
         this.trainedModel = null;
         this.preTokenizer = preTokenizer;
+        this.onTrainingComplete = onTrainingComplete;
+
+        /** @type {Worker|null} */
+        this._worker = null;
+        this._useWorker = typeof Worker !== 'undefined' && !!navigator.gpu;
     }
 
     canTrain() {
@@ -26,39 +31,128 @@ export class TrainingManager {
 
         const shouldShuffle = $('shuffleToggle').checked && this.fileManager.files.length > 1;
 
-        // When pre-tokenizer is available, pass corpus as string for Unicode-accurate processing
-        const corpusData = this.preTokenizer
-            ? this.fileManager.buildCorpusAsString(shouldShuffle)
-            : this.fileManager.buildCorpus(shouldShuffle);
+        // Always pass raw bytes — preTokenizeBytes handles NFC normalize + classify in WASM
+        // (eliminates 5 unnecessary string<->bytes conversions; see WASM_NORMALIZE_BYTES_SPEC.md)
+        const corpusData = this.fileManager.buildCorpus(shouldShuffle);
 
-        const sizeStr = typeof corpusData === 'string'
-            ? formatSize(new TextEncoder().encode(corpusData).length)
-            : formatSize(corpusData.length);
+        const sizeStr = formatSize(corpusData.length);
 
         this.logger.log(`\n─ corpus: ${sizeStr} · vocab target: ${this.uiManager.selectedVocab.toLocaleString()}`);
 
         try {
-            const result = await this.train(corpusData);
-            this.trainedModel = result; // Store the result
+            const result = this._useWorker
+                ? await this._trainInWorker(corpusData)
+                : await this._trainInline(corpusData);
+
+            this.trainedModel = result;
             this.uiManager.displayTrainingComplete(result);
             this.uiManager.updateVocabStatus(result.vocabSize);
 
             // Reveal tokenizer encode section
             $('tokenizerSection').classList.remove('hidden');
+
+            // Notify export controller
+            if (this.onTrainingComplete) this.onTrainingComplete(result.vocabSize);
         } catch (error) {
             this.logger.log(`✗ Training failed: ${error.message}`);
             trainBtn.disabled = false;
         }
     }
 
-    async train(corpusData) {
+    // ─── Worker-based Training ──────────────────────────────
+
+    /**
+     * Run training in a dedicated Web Worker (non-blocking).
+     * Worker creates its own GPUDevice + pipelines.
+     */
+    async _trainInWorker(corpusData) {
+        return new Promise((resolve, reject) => {
+            // Pre-tokenize on main thread (needs WASM), then send raw bytes to worker
+            let corpusBytes;
+            if (this.preTokenizer && corpusData instanceof Uint8Array) {
+                this.logger.log('  → pre-tokenizing bytes on main thread (zero-copy path)…');
+                const result = this.preTokenizer.preTokenizeBytes(corpusData);
+                if (result.bytes.length === 0 && corpusData.length > 0) {
+                    this.logger.log('  ⚠ preTokenizeBytes returned 0 bytes — falling back to raw');
+                    corpusBytes = corpusData;
+                } else {
+                    corpusBytes = result.bytes;
+                }
+            } else {
+                corpusBytes = corpusData instanceof Uint8Array
+                    ? corpusData
+                    : new TextEncoder().encode(corpusData);
+            }
+
+            // Create worker (module type for ES imports)
+            const worker = new Worker(
+                new URL('../bpe/bpe-worker.js', import.meta.url),
+                { type: 'module' }
+            );
+            this._worker = worker;
+
+            worker.onmessage = (e) => {
+                const msg = e.data;
+
+                switch (msg.type) {
+                    case 'progress':
+                        this.uiManager.updateProgress(msg);
+                        break;
+
+                    case 'done':
+                        this.logger.log('✓ Training complete (worker)');
+                        worker.terminate();
+                        this._worker = null;
+                        resolve(msg.result);
+                        break;
+
+                    case 'error':
+                        this.logger.log(`✗ Worker error: ${msg.message}`);
+                        worker.terminate();
+                        this._worker = null;
+                        reject(new Error(msg.message));
+                        break;
+
+                    case 'log':
+                        this.logger.log(msg.text);
+                        break;
+                }
+            };
+
+            worker.onerror = (err) => {
+                this.logger.log(`✗ Worker crash: ${err.message}`);
+                worker.terminate();
+                this._worker = null;
+                reject(new Error(err.message));
+            };
+
+            // Transfer corpus buffer to worker (zero-copy)
+            const buffer = corpusBytes.buffer.slice(
+                corpusBytes.byteOffset,
+                corpusBytes.byteOffset + corpusBytes.byteLength
+            );
+            worker.postMessage({
+                cmd: 'train',
+                corpus: buffer,
+                vocabSize: this.uiManager.selectedVocab,
+            }, [buffer]);
+        });
+    }
+
+    // ─── Inline Training (fallback) ─────────────────────────
+
+    /**
+     * Original inline training path (blocks main thread).
+     * Used when Workers are not available.
+     */
+    async _trainInline(corpusData) {
         const trainer = new BPETrainer(this.bpeEngine);
         this.lastTrainer = trainer;
 
         return await trainer.train(corpusData, {
             targetVocabSize: this.uiManager.selectedVocab,
             preTokenizer: this.preTokenizer,
-            onProgress: (progress) => this.uiManager.updateProgress(progress)
+            onProgress: (progress) => this.uiManager.updateProgress(progress),
         });
     }
 

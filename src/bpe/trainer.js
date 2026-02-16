@@ -248,7 +248,6 @@ function allocTrainingBuffers(device, maxSymbols) {
 
         // Compaction
         validMask: allocBuffer(device, maxSymbols * 4, GPUBufferUsage.STORAGE),
-        prefixSum: allocBuffer(device, maxSymbols * 4, GPUBufferUsage.STORAGE),
         blockSums: allocBuffer(device, maxBlocks * 4, GPUBufferUsage.STORAGE),
         totalValid: allocBuffer(device, 4, BUFFER_USAGE.STORAGE_SRC),
         compact: allocBuffer(device, maxSymbols * 4, BUFFER_USAGE.STORAGE_SRC),
@@ -256,6 +255,11 @@ function allocTrainingBuffers(device, maxSymbols) {
         // Batched iteration
         iterState: allocBuffer(device, ITER_STATE_SIZE, BUFFER_USAGE.STORAGE_ALL),
         mergeLog: allocBuffer(device, BATCH_SIZE * MERGE_LOG_STRIDE * 4, BUFFER_USAGE.STORAGE_SRC),
+
+        // Indirect dispatch buffer (3 × u32: wgX, wgY, wgZ)
+        // Written by bpe_update_count kernel, read by dispatchWorkgroupsIndirect
+        indirectDispatch: allocBuffer(device, 12,
+            GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST),
 
         // Readback staging
         readbackState: allocBuffer(device, ITER_STATE_SIZE, BUFFER_USAGE.READBACK),
@@ -279,8 +283,8 @@ function destroyTrainingBuffers(b) {
         b.pairCounts, b.pairIds,
         b.blockMaxCounts, b.blockMaxPairIds,
         b.maxCount, b.maxPairId,
-        b.validMask, b.prefixSum, b.blockSums, b.totalValid, b.compact,
-        b.iterState, b.mergeLog,
+        b.validMask, b.blockSums, b.totalValid, b.compact,
+        b.iterState, b.mergeLog, b.indirectDispatch,
         b.readbackState, b.readbackLog,
         b.clearTableParam, b.findMaxParam1, b.findMaxParam2,
     ]);
@@ -346,28 +350,25 @@ function buildBindGroups(device, pipelines, symbolBufA, symbolBufB, tb) {
             symbolBufB, tb.validMask, tb.iterState,
         ]),
 
-        // Three-phase prefix sum
+        // Two-phase prefix sum (reduce + scan)
         prefixReduce: bg(p.bpe_prefix_sum_reduce_b, [
             tb.validMask, tb.blockSums, tb.iterState,
         ]),
         prefixScan: bg(p.bpe_prefix_sum_scan_blocks_b, [
             tb.blockSums, tb.totalValid, tb.iterState,
         ]),
-        prefixFinalize: bg(p.bpe_prefix_sum_finalize_b, [
-            tb.validMask, tb.prefixSum, tb.blockSums, tb.iterState,
+
+        // Fused finalize + compact (prefix_sum stays in registers)
+        finalizeCompactAB: bg(p.bpe_finalize_compact_b, [
+            tb.validMask, tb.blockSums, symbolBufA, symbolBufB, tb.iterState,
+        ]),
+        finalizeCompactBA: bg(p.bpe_finalize_compact_b, [
+            tb.validMask, tb.blockSums, symbolBufB, symbolBufA, tb.iterState,
         ]),
 
-        // Ping-pong compact
-        compactAB: bg(p.bpe_compact_b, [
-            symbolBufA, tb.validMask, symbolBufB, tb.prefixSum, tb.iterState,
-        ]),
-        compactBA: bg(p.bpe_compact_b, [
-            symbolBufB, tb.validMask, symbolBufA, tb.prefixSum, tb.iterState,
-        ]),
-
-        // Update count
+        // Update count + indirect dispatch
         updateCount: bg(p.bpe_update_count, [
-            tb.totalValid, tb.iterState,
+            tb.totalValid, tb.iterState, tb.indirectDispatch,
         ]),
     };
 }
@@ -377,7 +378,7 @@ function buildBindGroups(device, pipelines, symbolBufA, symbolBufB, tb) {
 /**
  * Encode one batch of BPE merge iterations into a command encoder.
  */
-function encodeBatch(cmd, pipelines, bg, batchMerges, maxDispatch, maxBlocks, findMaxBlocks) {
+function encodeBatch(cmd, pipelines, bg, batchMerges, maxDispatch, maxBlocks, findMaxBlocks, indirectBuf) {
     const p = pipelines;
 
     for (let i = 0; i < batchMerges; i++) {
@@ -387,26 +388,51 @@ function encodeBatch(cmd, pipelines, bg, batchMerges, maxDispatch, maxBlocks, fi
         encodePass(cmd, p.bpe_clear_table, bg.clearTable,
             Math.ceil(TABLE_SIZE / WORKGROUP_SIZE));
 
-        encodePass(cmd, p.bpe_pair_count_b, even ? bg.pairCountA : bg.pairCountB,
-            maxDispatch);
+        // First iteration uses static maxDispatch; subsequent use indirect buffer
+        if (i === 0) {
+            encodePass(cmd, p.bpe_pair_count_b, even ? bg.pairCountA : bg.pairCountB,
+                maxDispatch);
+        } else {
+            encodeIndirectPass(cmd, p.bpe_pair_count_b,
+                even ? bg.pairCountA : bg.pairCountB, indirectBuf);
+        }
 
         encodePass(cmd, p.bpe_find_max_pair, bg.findMax1, findMaxBlocks);
         encodePass(cmd, p.bpe_find_max_pair_final, bg.findMax2, 1);
         encodePass(cmd, p.bpe_setup_merge, bg.setupMerge, 1);
 
-        // Phase B: fillValid → merge → prefixSum → compact → updateCount
-        encodePass(cmd, p.bpe_fill_valid_b, bg.fillValid, maxDispatch);
-        encodePass(cmd, p.bpe_merge_b, even ? bg.mergeA : bg.mergeB, maxDispatch);
+        // Phase B: fillValid → merge → prefixReduce → prefixScan → finalizeCompact → updateCount
+        // All dynamic kernels use indirect dispatch (except first iteration)
+        if (i === 0) {
+            encodePass(cmd, p.bpe_fill_valid_b, bg.fillValid, maxDispatch);
+            encodePass(cmd, p.bpe_merge_b, even ? bg.mergeA : bg.mergeB, maxDispatch);
+            encodePass(cmd, p.bpe_prefix_sum_reduce_b, bg.prefixReduce, maxBlocks);
+            encodePass(cmd, p.bpe_prefix_sum_scan_blocks_b, bg.prefixScan, 1);
+            encodePass(cmd, p.bpe_finalize_compact_b,
+                even ? bg.finalizeCompactAB : bg.finalizeCompactBA, maxDispatch);
+        } else {
+            encodeIndirectPass(cmd, p.bpe_fill_valid_b, bg.fillValid, indirectBuf);
+            encodeIndirectPass(cmd, p.bpe_merge_b, even ? bg.mergeA : bg.mergeB, indirectBuf);
+            encodeIndirectPass(cmd, p.bpe_prefix_sum_reduce_b, bg.prefixReduce, indirectBuf);
+            encodePass(cmd, p.bpe_prefix_sum_scan_blocks_b, bg.prefixScan, 1);
+            encodeIndirectPass(cmd, p.bpe_finalize_compact_b,
+                even ? bg.finalizeCompactAB : bg.finalizeCompactBA, indirectBuf);
+        }
 
-        // Prefix sum (3-phase)
-        encodePass(cmd, p.bpe_prefix_sum_reduce_b, bg.prefixReduce, maxBlocks);
-        encodePass(cmd, p.bpe_prefix_sum_scan_blocks_b, bg.prefixScan, 1);
-        encodePass(cmd, p.bpe_prefix_sum_finalize_b, bg.prefixFinalize, maxBlocks);
-
-        // Compact + update
-        encodePass(cmd, p.bpe_compact_b, even ? bg.compactAB : bg.compactBA, maxDispatch);
+        // Update count + write next indirect dispatch params
         encodePass(cmd, p.bpe_update_count, bg.updateCount, 1);
     }
+}
+
+/**
+ * Encode a single compute pass with indirect dispatch.
+ */
+function encodeIndirectPass(cmd, pipeline, bindGroup, indirectBuffer) {
+    const pass = cmd.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroupsIndirect(indirectBuffer, 0);
+    pass.end();
 }
 
 /**
@@ -430,6 +456,26 @@ function encodePass(cmd, pipeline, bindGroup, workgroups) {
  * @returns {Promise<{ symbolData: Uint32Array, wordStarts: Uint8Array|null }>}
  */
 async function prepareInput(input, preTokenizer) {
+    // ── Byte-native path: Uint8Array → WASM normalizeBytes → classifyBytes → boundaries ──
+    if (preTokenizer && input instanceof Uint8Array) {
+        console.log('   Mode: WASM pre-tokenized bytes (zero-copy path)');
+        console.log(`   Input: ${(input.length / 1048576).toFixed(1)} MB raw bytes`);
+        await yieldToEventLoop();
+
+        const result = preTokenizer.preTokenizeBytes(input);
+
+        if (result.bytes.length === 0 && input.length > 0) {
+            console.warn('   ⚠ preTokenizeBytes returned 0 bytes — falling back to byte-level');
+            return { symbolData: bytesToSymbols(input), wordStarts: null };
+        }
+
+        const symbolData = new Uint32Array(result.bytes.length);
+        for (let i = 0; i < result.bytes.length; i++) symbolData[i] = result.bytes[i];
+
+        return { symbolData, wordStarts: result.wordStarts };
+    }
+
+    // ── String path: normalize via WASM string API → codepoint classify → boundaries ──
     if (preTokenizer && typeof input === 'string') {
         console.log('   Mode: WASM pre-tokenized (Unicode 17.0)');
         console.log(`   Input: ${input.length} chars (${(new TextEncoder().encode(input).length / 1048576).toFixed(1)} MB)`);
@@ -451,6 +497,7 @@ async function prepareInput(input, preTokenizer) {
         return { symbolData, wordStarts: result.wordStarts };
     }
 
+    // ── Fallback: raw byte-level (no pre-tokenization) ──
     console.log('   Mode: Byte-level (WASM-normalized)');
     const bytes = typeof input === 'string' ? new TextEncoder().encode(input) : input;
 
@@ -546,6 +593,12 @@ export class BPETrainer {
             0, 0,                     // padding
         ]));
 
+        // ── Initialize indirect dispatch buffer ──
+        const initWG = Math.ceil(symbolCount / WORKGROUP_SIZE);
+        const wgX = Math.min(initWG, 65535);
+        const wgY = initWG <= 65535 ? 1 : Math.ceil(initWG / 65535);
+        device.queue.writeBuffer(tb.indirectDispatch, 0, new Uint32Array([wgX, wgY, 1]));
+
         // ── Build bind groups ──
         let bg = buildBindGroups(device, pipelines, symbolBuf, tb.compact, tb);
 
@@ -587,7 +640,7 @@ export class BPETrainer {
             const cmd = device.createCommandEncoder();
 
             encodeBatch(cmd, pipelines, bg, batchMerges,
-                maxDispatch, tb.maxBlocks, tb.findMaxBlocks);
+                maxDispatch, tb.maxBlocks, tb.findMaxBlocks, tb.indirectDispatch);
 
             // Copy state + merge log for readback
             cmd.copyBufferToBuffer(tb.iterState, 0, tb.readbackState, 0, ITER_STATE_SIZE);

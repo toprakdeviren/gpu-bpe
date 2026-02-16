@@ -6,6 +6,7 @@
  */
 
 import { WORKGROUP_SIZE, INVALID_TOKEN } from './engine.js';
+import { compileVocabToTrie } from './trie-compiler.js';
 
 // ─── Constants ───────────────────────────────────────────────
 const TRIE_MAGIC = 0x54524945;
@@ -193,6 +194,20 @@ export class TrieTokenizer {
         this.#edgesBuf = uploadBuffer(this.#device, edges, GPUBufferUsage.STORAGE);
 
         console.log(`[ok] TrieTokenizer: ${this.nodeCount} nodes, ${this.edgeCount} edges`);
+    }
+
+    /**
+     * Create a TrieTokenizer directly from a BPE vocabulary.
+     * Compiles the vocab into a binary trie in-memory (no .trie file needed).
+     *
+     * @param {import('./engine.js').BPEEngine} engine
+     * @param {number[][]} vocab - Vocab byte arrays from BPE training
+     * @param {{ chunkSize?: number }} [options]
+     * @returns {TrieTokenizer}
+     */
+    static fromVocab(engine, vocab, options = {}) {
+        const trieData = compileVocabToTrie(vocab);
+        return new TrieTokenizer(engine, trieData, vocab, options);
     }
 
     // ─── Encode ─────────────────────────────────────────────

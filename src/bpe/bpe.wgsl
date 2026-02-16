@@ -7,7 +7,7 @@
  * at those markers and compiles each kernel as a separate GPUShaderModule,
  * prepending the shared utility section (everything before the first marker).
  *
- * Training Kernels (1-13) + Inference Kernels (14-15).
+ * Training Kernels (1-11) + Inference Kernels (12-13).
  */
 
 // ════════════════════════════════════════════════════════════
@@ -16,6 +16,7 @@
 
 const WORKGROUP_SIZE: u32 = 256u;
 const MAX_PROBE: u32 = 128u;
+const MAX_WG_DIM: u32 = 65535u;  // WebGPU maxComputeWorkgroupsPerDimension
 const INVALID_TOKEN: u32 = 0xFFFFFFFFu;
 const WORD_START_BIT: u32 = 0x10000u;  // bit 16 = word-start flag
 const TOKEN_MASK: u32 = 0xFFFFu;       // lower 16 bits = token ID
@@ -41,13 +42,13 @@ struct IterState {
     _pad2: u32,
 }
 
-fn pair_hash(pair: u32, table_size: u32) -> u32 {
-    var h: u32 = 0x811C9DC5u;
-    h = h ^ (pair & 0xFFu);          h = h * 0x01000193u;
-    h = h ^ ((pair >> 8u) & 0xFFu);  h = h * 0x01000193u;
-    h = h ^ ((pair >> 16u) & 0xFFu); h = h * 0x01000193u;
-    h = h ^ ((pair >> 24u) & 0xFFu); h = h * 0x01000193u;
-    return h % table_size;
+/// Murmur3 integer finalizer — 6 ALU ops instead of FNV-1a's 16.
+/// Returns raw hash; caller applies `& table_mask` for power-of-2 tables.
+fn pair_hash(pair: u32) -> u32 {
+    var x = pair;
+    x = (x ^ (x >> 16u)) * 0x7feb352du;
+    x = (x ^ (x >> 15u)) * 0x846ca68bu;
+    return x ^ (x >> 16u);
 }
 
 /// Linearize a 2D dispatch grid into a flat 1D thread index.
@@ -83,25 +84,23 @@ struct WordBoundaryParams { symbol_count: u32, _pad: u32 }
 @group(0) @binding(0) var<storage, read_write> symbols: array<u32>;
 @group(0) @binding(1) var<uniform> params: WordBoundaryParams;
 
+/// Character classification with reduced branch divergence.
+/// Uses unsigned subtraction trick: `(tok - base) <= range` is branchless-friendly
+/// and covers the entire range in a single comparison.
 fn char_class(tok: u32) -> u32 {
     // Newline — own class (always a word boundary)
     if (tok == 0x0Au) { return 4u; }
     // Space
     if (tok == 0x20u) { return 2u; }
-    // Digit 0-9
-    if (tok >= 0x30u && tok <= 0x39u) { return 1u; }
-    // ASCII letter a-z (already lowercased in _byteLevelLoad)
-    if (tok >= 0x61u && tok <= 0x7Au) { return 0u; }
-    // ASCII uppercase A-Z (in case not lowercased)
-    if (tok >= 0x41u && tok <= 0x5Au) { return 0u; }
-    // Latin Extended (À-ɏ, covers Turkish İĞŞÇÖÜ mapped bytes and accented chars)
-    if (tok >= 0xC0u && tok <= 0x24Fu) { return 0u; }
-    // Common continuation byte range from multi-byte UTF-8 in byte-level mode.
-    // In byte-level BPE, bytes 0x80-0xBF are UTF-8 continuations — treat as letter
-    // so multi-byte characters don't get split at the wrong boundary.
-    if (tok >= 0x80u && tok <= 0xBFu) { return 0u; }
-    // UTF-8 leading bytes for multi-byte sequences (0xC0-0xFF) — treat as letter
-    if (tok >= 0xC0u) { return 0u; }
+    // Digit 0-9 (0x30..0x39)
+    if (tok - 0x30u <= 9u) { return 1u; }
+    // UTF-8 continuation + leading bytes (0x80-0xFF) — all treated as letter
+    // Covers multi-byte chars, Turkish İĞŞÇÖÜ, Arabic, etc.
+    if (tok >= 0x80u) { return 0u; }
+    // ASCII letter a-z (0x61..0x7A)
+    if (tok - 0x61u <= 25u) { return 0u; }
+    // ASCII letter A-Z (0x41..0x5A)
+    if (tok - 0x41u <= 25u) { return 0u; }
     // Everything else = punctuation
     return 3u;
 }
@@ -216,9 +215,9 @@ fn bpe_pair_count(
             let b = raw_b & TOKEN_MASK;
             if (a != 0u && b != 0u) {
                 let pid = pack_pair(a, b);
-                let h = pid ^ (pid >> 16u);  // fast hash for small table
+                let h = pair_hash(pid);   // Murmur3 finalizer — better avalanche, less probe divergence
                 for (var probe: u32 = 0u; probe < LOCAL_MAX_PROBE; probe++) {
-                    let idx = (h + probe) & LOCAL_TABLE_MASK;
+                    let idx = (h + (probe * (probe + 1u)) / 2u) & LOCAL_TABLE_MASK;
                     let r = atomicCompareExchangeWeak(&local_ids[idx], 0u, pid);
                     if (r.exchanged || r.old_value == pid) {
                         atomicAdd(&local_counts[idx], 1u);
@@ -236,9 +235,10 @@ fn bpe_pair_count(
         if (cnt == 0u) { continue; }
         let pid = atomicLoad(&local_ids[slot]);
         if (pid == 0u) { continue; }
-        let hash = pair_hash(pid, params.table_size);
+        let table_mask = params.table_size - 1u;
+        let hash = pair_hash(pid) & table_mask;
         for (var probe: u32 = 0u; probe < MAX_PROBE; probe++) {
-            let idx = (hash + probe) % params.table_size;
+            let idx = (hash + (probe * (probe + 1u)) / 2u) & table_mask;
             let r = atomicCompareExchangeWeak(&pair_ids[idx], 0u, pid);
             if (r.exchanged || r.old_value == pid) {
                 atomicAdd(&pair_counts[idx], cnt);  // flush aggregated count
@@ -521,34 +521,32 @@ struct TrieParams { input_length: u32, chunk_size: u32, max_tokens_per_chunk: u3
 @group(0) @binding(4) var<storage, read_write> chunk_counts: array<u32>;
 @group(0) @binding(5) var<uniform> params: TrieParams;
 
-// Cached root edges: [symbol, targetNode] pairs in shared memory
-var<workgroup> cached_edge_sym: array<u32, 256>;   // edge symbols
-var<workgroup> cached_edge_tgt: array<u32, 256>;   // edge target nodes
+// O(1) Root LUT: Direct byte→node lookup table in shared memory.
+// Replaces binary search (up to 8 iterations, warp divergence)
+// with a single branchless array read.
+var<workgroup> root_lut: array<u32, 256>;
 var<workgroup> cached_root_fc: u32;                 // root firstChild
 var<workgroup> cached_root_nc: u32;                 // root numChildren
 
-/// Find child using CACHED root edges (shared memory — no global reads)
-fn find_root_child(sym: u32) -> u32 {
-    var lo: u32 = 0u; var hi = cached_root_nc;
-    while (lo < hi) {
-        let mid = lo + (hi - lo) / 2u;
-        let es = cached_edge_sym[mid];
-        if (es == sym) { return cached_edge_tgt[mid]; }
-        else if (es < sym) { lo = mid + 1u; }
-        else { hi = mid; }
-    }
-    return INVALID_TOKEN;
-}
-
-/// Find child using global memory (non-root nodes)
+/// Find child using global memory (non-root nodes).
+/// Branchless lower_bound: `select()` compiles to predication — no SIMD
+/// mask split, no warp divergence. All threads execute the same number
+/// of iterations (⌈log₂(num)⌉), trading early-exit for uniform execution.
 fn find_child_global(first: u32, num: u32, sym: u32) -> u32 {
-    var lo = first; var hi = first + num;
-    while (lo < hi) {
-        let mid = lo + (hi - lo) / 2u;
-        let es = edges[mid * 2u] & 0xFFu;
-        if (es == sym) { return edges[mid * 2u + 1u]; }
-        else if (es < sym) { lo = mid + 1u; }
-        else { hi = mid; }
+    var lo: u32 = 0u;
+    var n: u32 = num;
+    while (n > 0u) {
+        let half = n >> 1u;
+        let mid = lo + half;
+        let less = (edges[(first + mid) * 2u] & 0xFFu) < sym;
+        lo = select(lo, mid + 1u, less);
+        n = select(half, n - half - 1u, less);
+    }
+    if (lo < num) {
+        let slot = (first + lo) * 2u;
+        if ((edges[slot] & 0xFFu) == sym) {
+            return edges[slot + 1u];
+        }
     }
     return INVALID_TOKEN;
 }
@@ -558,18 +556,20 @@ fn trie_tokenizer_chunked(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>
 ) {
-    // Cooperatively cache root's edge table into shared memory
+    // Build O(1) root LUT: 256 threads fill 256 slots
+    // Step 1: Initialize all slots to INVALID (no child for this byte)
+    root_lut[lid.x] = INVALID_TOKEN;
     if (lid.x == 0u) {
         cached_root_fc = nodes[0];                    // root.firstChild
         cached_root_nc = nodes[1] & 0xFFFFu;          // root.numChildren
     }
     workgroupBarrier();
+    // Step 2: Scatter valid edges into LUT by byte value
     let nc = min(cached_root_nc, MAX_CACHED_EDGES);
     let fc = cached_root_fc;
-    // 256 threads load up to 256 edges cooperatively
     if (lid.x < nc) {
-        cached_edge_sym[lid.x] = edges[(fc + lid.x) * 2u] & 0xFFu;
-        cached_edge_tgt[lid.x] = edges[(fc + lid.x) * 2u + 1u];
+        let sym = edges[(fc + lid.x) * 2u] & 0xFFu;
+        root_lut[sym] = edges[(fc + lid.x) * 2u + 1u];  // Direct: byte → target node
     }
     workgroupBarrier();
 
@@ -587,8 +587,8 @@ fn trie_tokenizer_chunked(
             let bv = input[wp] & 0xFFu;
             var nn: u32;
             if (cn == 0u) {
-                // Fast path: use cached root edges (shared memory)
-                nn = find_root_child(bv);
+                // O(1) direct LUT lookup — branchless, no divergence
+                nn = root_lut[bv];
             } else {
                 // Normal path: global memory lookup
                 let nfc = nodes[cn * 3u]; let nnc = nodes[cn * 3u + 1u] & 0xFFFFu;
@@ -630,112 +630,9 @@ fn trie_tokenizer_compact(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
-// ════════════════════════════════════════════════════════════
-// GPU VOCAB MANAGEMENT KERNELS
-// ════════════════════════════════════════════════════════════
-
-// --- KERNEL: vocab_merge ---
-
-const MAX_TOKEN_LENGTH: u32 = 256u;  // Max bytes per token
-
-struct VocabMergeParams {
-    token_a: u32,           // ID of first token to merge
-    token_b: u32,           // ID of second token to merge
-    new_token_id: u32,      // ID for merged token
-    _pad: u32
-}
-
-@group(0) @binding(0) var<storage, read> vocab_lengths: array<u32>;      // Length of each token
-@group(0) @binding(1) var<storage, read> vocab_data: array<u32>;         // Packed token bytes (4 bytes per u32)
-@group(0) @binding(2) var<storage, read_write> new_vocab_lengths: array<u32>;
-@group(0) @binding(3) var<storage, read_write> new_vocab_data: array<u32>;
-@group(0) @binding(4) var<uniform> params: VocabMergeParams;
-
-@compute @workgroup_size(1)
-fn vocab_merge(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let len_a = vocab_lengths[params.token_a];
-    let len_b = vocab_lengths[params.token_b];
-    let new_len = len_a + len_b;
-
-    if (new_len > MAX_TOKEN_LENGTH) {
-        return;  // Token too long
-    }
-
-    // Calculate byte offsets (each token gets MAX_TOKEN_LENGTH/4 u32s)
-    let offset_a = params.token_a * (MAX_TOKEN_LENGTH / 4u);
-    let offset_b = params.token_b * (MAX_TOKEN_LENGTH / 4u);
-    let offset_new = params.new_token_id * (MAX_TOKEN_LENGTH / 4u);
-
-    // Copy token A bytes
-    let words_a = (len_a + 3u) / 4u;  // Round up to u32 count
-    for (var i: u32 = 0u; i < words_a; i++) {
-        new_vocab_data[offset_new + i] = vocab_data[offset_a + i];
-    }
-
-    // Copy token B bytes (starting after token A)
-    let words_b = (len_b + 3u) / 4u;
-    let byte_offset_in_word = len_a % 4u;
-
-    if (byte_offset_in_word == 0u) {
-        // Aligned: direct copy
-        for (var i: u32 = 0u; i < words_b; i++) {
-            new_vocab_data[offset_new + words_a + i] = vocab_data[offset_b + i];
-        }
-    } else {
-        // Unaligned: need to shift and combine
-        let shift_left = byte_offset_in_word * 8u;
-        let shift_right = 32u - shift_left;
-
-        var prev_word = vocab_data[offset_b];
-        new_vocab_data[offset_new + words_a - 1u] |= (prev_word << shift_left);
-
-        for (var i: u32 = 1u; i < words_b; i++) {
-            let curr_word = vocab_data[offset_b + i];
-            new_vocab_data[offset_new + words_a + i - 1u] |= (prev_word >> shift_right);
-            new_vocab_data[offset_new + words_a + i] = (curr_word << shift_left);
-            prev_word = curr_word;
-        }
-
-        if (words_b > 0u) {
-            new_vocab_data[offset_new + words_a + words_b - 1u] |= (prev_word >> shift_right);
-        }
-    }
-
-    // Set new token length
-    new_vocab_lengths[params.new_token_id] = new_len;
-}
-
-// --- KERNEL: check_early_stop ---
-
-struct EarlyStopParams {
-    best_count: u32,        // Count of most frequent pair
-    current_vocab_size: u32, // Current number of tokens
-    max_vocab_size: u32,    // Target vocab size (e.g., 65535)
-    _pad: u32
-}
-
-@group(0) @binding(0) var<storage, read> params: EarlyStopParams;
-@group(0) @binding(1) var<storage, read_write> should_stop: array<atomic<u32>>;
-
-@compute @workgroup_size(1)
-fn check_early_stop(@builtin(global_invocation_id) gid: vec3<u32>) {
-    var stop: u32 = 0u;
-
-    // Stop if no more pairs to merge (count < 2)
-    if (params.best_count < 2u) {
-        stop = 1u;
-    }
-
-    // Stop if reached vocab size limit
-    if (params.current_vocab_size >= params.max_vocab_size) {
-        stop = 1u;
-    }
-
-    // Atomic write to ensure visibility
-    if (stop == 1u) {
-        atomicStore(&should_stop[0], 1u);
-    }
-}
+// NOTE: Legacy GPU vocab management kernels (vocab_merge, check_early_stop) removed.
+// Vocab management is handled CPU-side in Vocab.addMerge().
+// Early stop logic is integrated into bpe_setup_merge.
 
 // ════════════════════════════════════════════════════════════
 // BATCHED TRAINING KERNELS — GPU-driven merge loop
@@ -807,6 +704,7 @@ fn bpe_pair_count_b(
 
     if (state.early_stop != 0u) { return; }
 
+    // Phase 1: Aggregate into LOCAL shared-memory table
     let id = flat_id(gid, nwg);
     if (id + 1u < state.symbol_count) {
         let raw_b = symbols[id + 1u];
@@ -815,9 +713,9 @@ fn bpe_pair_count_b(
             let b = raw_b & TOKEN_MASK;
             if (a != 0u && b != 0u) {
                 let pid = pack_pair(a, b);
-                let h = pid ^ (pid >> 16u);
+                let h = pair_hash(pid);   // Murmur3 finalizer — better avalanche than Knuth
                 for (var probe: u32 = 0u; probe < LOCAL_MAX_PROBE; probe++) {
-                    let idx = (h + probe) & LOCAL_TABLE_MASK;
+                    let idx = (h + (probe * (probe + 1u)) / 2u) & LOCAL_TABLE_MASK;
                     let r = atomicCompareExchangeWeak(&local_ids[idx], 0u, pid);
                     if (r.exchanged || r.old_value == pid) {
                         atomicAdd(&local_counts[idx], 1u);
@@ -829,14 +727,16 @@ fn bpe_pair_count_b(
     }
     workgroupBarrier();
 
+    // Phase 2: Flush local table → global table
     for (var slot: u32 = lid.x; slot < LOCAL_TABLE_SIZE; slot += WORKGROUP_SIZE) {
         let cnt = atomicLoad(&local_counts[slot]);
         if (cnt == 0u) { continue; }
         let pid = atomicLoad(&local_ids[slot]);
         if (pid == 0u) { continue; }
-        let hash = pair_hash(pid, state.table_size);
+        let table_mask = state.table_size - 1u;
+        let hash = pair_hash(pid) & table_mask;
         for (var probe: u32 = 0u; probe < MAX_PROBE; probe++) {
-            let idx = (hash + probe) % state.table_size;
+            let idx = (hash + (probe * (probe + 1u)) / 2u) & table_mask;
             let r = atomicCompareExchangeWeak(&pair_ids[idx], 0u, pid);
             if (r.exchanged || r.old_value == pid) {
                 atomicAdd(&pair_counts[idx], cnt);
@@ -929,17 +829,30 @@ fn bpe_prefix_sum_scan_blocks_b(@builtin(global_invocation_id) gid: vec3<u32>) {
     total_valid[0] = sum;
 }
 
-// --- KERNEL: bpe_prefix_sum_finalize_b ---
+// --- KERNEL: bpe_finalize_compact_b ---
+//
+// Fused prefix_sum_finalize + compact: Blelloch exclusive scan in shared memory,
+// then directly scatter valid symbols to the output buffer.
+// Eliminates the prefix_sum intermediate buffer entirely — the exclusive scan
+// result stays in registers and is used immediately for the scatter index.
+//
+// Bindings:
+//   0: valid_mask      (read)   — 1-bit per symbol: valid or merged-away
+//   1: block_sums      (read)   — per-block totals from prefix_sum_reduce
+//   2: input_symbols   (read)   — source symbol buffer (ping or pong)
+//   3: output_symbols  (rw)     — destination symbol buffer
+//   4: state           (read)   — IterState with symbol_count
 
 @group(0) @binding(0) var<storage, read> valid_mask: array<u32>;
-@group(0) @binding(1) var<storage, read_write> prefix_sum: array<u32>;
-@group(0) @binding(2) var<storage, read> block_sums: array<u32>;
-@group(0) @binding(3) var<storage, read> state: IterState;
+@group(0) @binding(1) var<storage, read> block_sums: array<u32>;
+@group(0) @binding(2) var<storage, read> input_symbols: array<u32>;
+@group(0) @binding(3) var<storage, read_write> output_symbols: array<u32>;
+@group(0) @binding(4) var<storage, read> state: IterState;
 
 var<workgroup> sh_data: array<u32, 256>;
 
 @compute @workgroup_size(256)
-fn bpe_prefix_sum_finalize_b(
+fn bpe_finalize_compact_b(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) tgid: vec3<u32>,
@@ -947,18 +860,27 @@ fn bpe_prefix_sum_finalize_b(
 ) {
     let fid = flat_id(gid, nwg);
     let block_idx = tgid.x + tgid.y * nwg.x;
+
+    // Load valid bit (0 or 1)
     var v: u32 = 0u;
     if (fid < state.symbol_count) { v = valid_mask[fid] & 1u; }
 
+    // ── Blelloch exclusive scan in shared memory ──
     sh_data[lid.x] = v;
     workgroupBarrier();
+
+    // Up-sweep (reduce)
     for (var d: u32 = 1u; d < WORKGROUP_SIZE; d <<= 1u) {
         let idx = (lid.x + 1u) * (d << 1u) - 1u;
         if (idx < WORKGROUP_SIZE) { sh_data[idx] += sh_data[idx - d]; }
         workgroupBarrier();
     }
+
+    // Clear root
     if (lid.x == 0u) { sh_data[WORKGROUP_SIZE - 1u] = 0u; }
     workgroupBarrier();
+
+    // Down-sweep
     for (var d: u32 = WORKGROUP_SIZE >> 1u; d > 0u; d >>= 1u) {
         let idx = (lid.x + 1u) * (d << 1u) - 1u;
         if (idx < WORKGROUP_SIZE) {
@@ -969,37 +891,41 @@ fn bpe_prefix_sum_finalize_b(
         workgroupBarrier();
     }
 
-    if (fid < state.symbol_count) {
-        prefix_sum[fid] = block_sums[block_idx] + sh_data[lid.x];
-    }
-}
-
-// --- KERNEL: bpe_compact_b ---
-
-@group(0) @binding(0) var<storage, read> input_symbols: array<u32>;
-@group(0) @binding(1) var<storage, read> valid_mask: array<u32>;
-@group(0) @binding(2) var<storage, read_write> output_symbols: array<u32>;
-@group(0) @binding(3) var<storage, read> prefix_sum: array<u32>;
-@group(0) @binding(4) var<storage, read> state: IterState;
-
-@compute @workgroup_size(256)
-fn bpe_compact_b(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let id = flat_id(gid, nwg);
-    if (id >= state.symbol_count) { return; }
-    if ((valid_mask[id] & 1u) == 1u) {
-        output_symbols[prefix_sum[id]] = input_symbols[id];
+    // ── Fused scatter: prefix_sum stays in register, write directly to output ──
+    if (fid < state.symbol_count && v == 1u) {
+        let dest = block_sums[block_idx] + sh_data[lid.x];
+        output_symbols[dest] = input_symbols[fid];
     }
 }
 
 // --- KERNEL: bpe_update_count ---
 //
-// After compact, copies totalValid → state.symbol_count for next iteration.
+// After compact: updates symbol_count AND computes indirect dispatch params
+// for the next iteration. This ensures all dynamic kernels dispatch only
+// the workgroups needed for the current (shrinking) symbol count.
+//
+// Indirect buffer layout: [wgX, wgY, wgZ] (3 × u32)
+// Follows WebGPU dispatchWorkgroupsIndirect format.
 
 @group(0) @binding(0) var<storage, read> total_valid: array<u32>;
 @group(0) @binding(1) var<storage, read_write> state: IterState;
+@group(0) @binding(2) var<storage, read_write> indirect: array<u32>;
 
 @compute @workgroup_size(1)
 fn bpe_update_count(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (state.early_stop != 0u) { return; }
-    state.symbol_count = total_valid[0];
+
+    let new_count = total_valid[0];
+    state.symbol_count = new_count;
+
+    // Compute dispatch params for next iteration
+    let total_wg = (new_count + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+    if (total_wg <= MAX_WG_DIM) {
+        indirect[0] = max(total_wg, 1u);
+        indirect[1] = 1u;
+    } else {
+        indirect[0] = MAX_WG_DIM;
+        indirect[1] = (total_wg + MAX_WG_DIM - 1u) / MAX_WG_DIM;
+    }
+    indirect[2] = 1u;
 }

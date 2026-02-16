@@ -316,6 +316,44 @@ export class Decoder {
         });
     }
 
+    /**
+     * Normalize raw UTF-8 bytes without any JS string conversion.
+     * @param {Uint8Array} bytes — UTF-8 encoded input
+     * @param {number} [form=0] — NormalizationForm (0=NFC, 1=NFD, 2=NFKC, 3=NFKD)
+     * @returns {Uint8Array} — normalized UTF-8 bytes
+     */
+    normalizeBytes(bytes, form = NormalizationForm.NFC) {
+        const srcLen = bytes.length;
+        const cap = srcLen * 4; // worst-case expansion for decomposition
+        return this.#withAlloc([srcLen, cap, 4], (srcPtr, dstPtr, lenPtr) => {
+            this.#wasm.HEAPU8.set(bytes, srcPtr);
+            this.#int('decoder_normalize_utf8', srcPtr, srcLen, form, dstPtr, cap, lenPtr);
+            const outLen = this.#wasm.getValue(lenPtr, 'i32');
+            return new Uint8Array(this.#wasm.HEAPU8.buffer, dstPtr, outLen).slice();
+        });
+    }
+
+    /**
+     * Batch-classify UTF-8 bytes into per-codepoint CharClass values.
+     * Returns { classes: Uint8Array, codepointCount: number }.
+     * CharClass: 0=LETTER, 1=DIGIT, 2=WHITESPACE, 3=PUNCTUATION, 4=SYMBOL, 5=NEWLINE, 6=OTHER
+     * @param {Uint8Array} bytes — UTF-8 encoded input
+     * @returns {{ classes: Uint8Array, codepointCount: number }}
+     */
+    classifyBytes(bytes) {
+        const srcLen = bytes.length;
+        const cap = srcLen; // max codepoints ≤ bytes
+        return this.#withAlloc([srcLen, cap, 4], (srcPtr, classPtr, countPtr) => {
+            this.#wasm.HEAPU8.set(bytes, srcPtr);
+            this.#int('decoder_classify_codepoints', srcPtr, srcLen, classPtr, cap, countPtr);
+            const count = this.#wasm.getValue(countPtr, 'i32');
+            return {
+                classes: new Uint8Array(this.#wasm.HEAPU8.buffer, classPtr, count).slice(),
+                codepointCount: count,
+            };
+        });
+    }
+
     /** @param {string} str @param {number} [form=NFC] @returns {boolean} */
     isNormalized(str, form = NormalizationForm.NFC) {
         return this.#withUtf8(str, (ptr, len) =>

@@ -446,4 +446,109 @@ export class PreTokenizer {
 
         return encodeWithBoundaries(codepoints, cpWordStarts);
     }
+
+    /**
+     * Pre-tokenize raw UTF-8 bytes — zero JS-string-conversion path.
+     *
+     * Flow: Uint8Array → WASM normalizeBytes → WASM classifyBytes
+     *       → JS findWordBoundaries → byte-level word start mask
+     *
+     * @param {Uint8Array} rawBytes — raw UTF-8 file bytes
+     * @returns {{ bytes: Uint8Array, wordStarts: Uint8Array }}
+     */
+    preTokenizeBytes(rawBytes) {
+        if (!rawBytes || rawBytes.length === 0) return EMPTY_RESULT;
+
+        // 1. NFC normalize in WASM (bytes → bytes, zero string conversion)
+        let normalized;
+        try {
+            normalized = this.#decoder.normalizeBytes(rawBytes);
+        } catch (e) {
+            console.warn('PreTokenizer: WASM normalizeBytes failed, using raw bytes:', e.message);
+            normalized = rawBytes;
+        }
+
+        if (!normalized || normalized.length === 0) {
+            console.warn('PreTokenizer: normalizeBytes returned empty, using raw bytes');
+            normalized = rawBytes;
+        }
+
+        // 2. Decode UTF-8 bytes → codepoints (needed for word boundary detection)
+        const codepoints = utf8ToCodepoints(normalized);
+
+        // 3. Classify codepoints via WASM batch call (or JS fallback)
+        let classes;
+        try {
+            const result = this.#decoder.classifyBytes(normalized);
+            classes = result.classes;
+            // Sanity check: WASM returns per-codepoint classes
+            if (classes.length !== codepoints.length) {
+                console.warn(`PreTokenizer: classifyBytes count mismatch (${classes.length} vs ${codepoints.length}), using JS fallback`);
+                classes = this.#classifyAll(codepoints);
+            }
+        } catch (e) {
+            console.warn('PreTokenizer: classifyBytes failed, using JS fallback:', e.message);
+            classes = this.#classifyAll(codepoints);
+        }
+
+        // 4. Word boundary detection (JS — needs codepoint-level data)
+        const cpWordStarts = findWordBoundaries(codepoints, classes);
+
+        // 5. Map codepoint-level boundaries → byte-level boundaries
+        //    Since normalized is already valid UTF-8, we can just map directly
+        const wordStarts = new Uint8Array(normalized.length);
+        let byteIdx = 0;
+        for (let i = 0; i < codepoints.length; i++) {
+            if (cpWordStarts[i]) {
+                wordStarts[byteIdx] = 1;
+            }
+            byteIdx += utf8ByteLength(codepoints[i]);
+        }
+
+        return { bytes: normalized, wordStarts };
+    }
+}
+
+/**
+ * Decode UTF-8 bytes to codepoints without going through JS strings.
+ *
+ * @param {Uint8Array} bytes — valid UTF-8 byte sequence
+ * @returns {Uint32Array} — array of Unicode codepoints
+ */
+function utf8ToCodepoints(bytes) {
+    const len = bytes.length;
+    // Worst case: every byte is ASCII = len codepoints
+    const out = new Uint32Array(len);
+    let cpCount = 0;
+    let i = 0;
+
+    while (i < len) {
+        const b = bytes[i];
+        let cp, size;
+
+        if (b < 0x80) {
+            cp = b;
+            size = 1;
+        } else if ((b & 0xE0) === 0xC0) {
+            cp = (b & 0x1F) << 6
+                | (bytes[i + 1] & 0x3F);
+            size = 2;
+        } else if ((b & 0xF0) === 0xE0) {
+            cp = (b & 0x0F) << 12
+                | (bytes[i + 1] & 0x3F) << 6
+                | (bytes[i + 2] & 0x3F);
+            size = 3;
+        } else {
+            cp = (b & 0x07) << 18
+                | (bytes[i + 1] & 0x3F) << 12
+                | (bytes[i + 2] & 0x3F) << 6
+                | (bytes[i + 3] & 0x3F);
+            size = 4;
+        }
+
+        out[cpCount++] = cp;
+        i += size;
+    }
+
+    return out.subarray(0, cpCount);
 }

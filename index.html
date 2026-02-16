@@ -22,6 +22,7 @@
                     </div>
                     <nav class="tab-nav">
                         <button class="tab-btn active" data-tab="train">Train</button>
+                        <button class="tab-btn" data-tab="export">Export .bin</button>
                         <button class="tab-btn" data-tab="tokenizer">Tokenizer</button>
                     </nav>
                 </div>
@@ -184,6 +185,83 @@
                                 </div>
                             </div>
                             <div id="tokenizerOutput" class="tokenizer-output hidden"></div>
+                        </div>
+                    </section>
+                </div>
+            </div>
+
+            <!-- ═══ EXPORT .BIN TAB ═══ -->
+            <div class="tab-content" data-tab="export">
+                <div class="content-wrapper">
+                    <!-- Hero -->
+                    <div class="hero">
+                        <h1>Export training data</h1>
+                        <p>
+                            Tokenize text files with your BPE vocabulary and export as <code>.bin</code>
+                            for Transformer training. Uses the vocabulary from the Train tab or a loaded
+                            <code>.json</code>.
+                        </p>
+                    </div>
+
+                    <!-- Vocab Status -->
+                    <section>
+                        <label class="section-label">Vocabulary</label>
+                        <div id="exportVocabStatus" class="vocab-status">
+                            <div class="vocab-status-icon" id="exportVocabIcon">
+                                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                        d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+                                </svg>
+                            </div>
+                            <span id="exportVocabText">No vocabulary — train one or load a .json</span>
+                        </div>
+                        <div class="vocab-actions">
+                            <button id="exportLoadVocabBtn" class="btn btn-secondary">
+                                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                        d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
+                                </svg>
+                                <span>Load Vocabulary (.json)</span>
+                            </button>
+                            <input type="file" id="exportVocabInput" accept=".json" class="hidden">
+                        </div>
+                    </section>
+
+                    <!-- Text Files -->
+                    <section>
+                        <label class="section-label">Text Files</label>
+                        <div id="exportDropZone" class="drop-zone">
+                            <input type="file" id="exportFileInput" multiple
+                                accept=".txt,.md,.json,.csv,.tsv,.xml,.html,.py,.swift,.js,.rs,.c,.h,.go,.java,.kt">
+                            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                                    d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m6.75 12l-3-3m0 0l-3 3m3-3v6m-1.5-15H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+                            </svg>
+                            <div class="drop-zone-text">Drop text files or <span class="highlight">browse</span></div>
+                            <div class="drop-zone-hint">.txt .md and other text formats</div>
+                        </div>
+                        <div id="exportFileList" class="file-list"></div>
+                        <div id="exportFileSummary" class="file-summary hidden">
+                            <span id="exportFileTotal" class="file-total"></span>
+                        </div>
+                    </section>
+
+                    <!-- Export Button -->
+                    <section class="section-gap">
+                        <button id="exportBinBtn" class="btn btn-primary" disabled>
+                            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+                            </svg>
+                            <span id="exportBinBtnText">Tokenize & Export .bin</span>
+                        </button>
+                        <div id="exportProgress" class="progress-wrap hidden">
+                            <div class="progress-header">
+                                <span id="exportProgressLabel" class="progress-label">Tokenizing…</span>
+                            </div>
+                            <div class="progress-bar">
+                                <div id="exportProgressFill" class="progress-fill"></div>
+                            </div>
                         </div>
                     </section>
                 </div>
