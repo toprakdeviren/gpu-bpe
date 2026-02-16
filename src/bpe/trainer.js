@@ -249,7 +249,6 @@ function allocTrainingBuffers(device, maxSymbols) {
         // Compaction
         validMask: allocBuffer(device, maxSymbols * 4, GPUBufferUsage.STORAGE),
         blockSums: allocBuffer(device, maxBlocks * 4, GPUBufferUsage.STORAGE),
-        totalValid: allocBuffer(device, 4, BUFFER_USAGE.STORAGE_SRC),
         compact: allocBuffer(device, maxSymbols * 4, BUFFER_USAGE.STORAGE_SRC),
 
         // Batched iteration
@@ -283,7 +282,7 @@ function destroyTrainingBuffers(b) {
         b.pairCounts, b.pairIds,
         b.blockMaxCounts, b.blockMaxPairIds,
         b.maxCount, b.maxPairId,
-        b.validMask, b.blockSums, b.totalValid, b.compact,
+        b.validMask, b.blockSums, b.compact,
         b.iterState, b.mergeLog, b.indirectDispatch,
         b.readbackState, b.readbackLog,
         b.clearTableParam, b.findMaxParam1, b.findMaxParam2,
@@ -337,11 +336,6 @@ function buildBindGroups(device, pipelines, symbolBufA, symbolBufB, tb) {
             tb.maxCount, tb.maxPairId, tb.iterState, tb.mergeLog,
         ]),
 
-        // Fill valid mask
-        fillValid: bg(p.bpe_fill_valid_b, [
-            tb.validMask, tb.iterState,
-        ]),
-
         // Ping-pong merge
         mergeA: bg(p.bpe_merge_b, [
             symbolBufA, tb.validMask, tb.iterState,
@@ -355,7 +349,7 @@ function buildBindGroups(device, pipelines, symbolBufA, symbolBufB, tb) {
             tb.validMask, tb.blockSums, tb.iterState,
         ]),
         prefixScan: bg(p.bpe_prefix_sum_scan_blocks_b, [
-            tb.blockSums, tb.totalValid, tb.iterState,
+            tb.blockSums, tb.iterState,
         ]),
 
         // Fused finalize + compact (prefix_sum stays in registers)
@@ -366,9 +360,9 @@ function buildBindGroups(device, pipelines, symbolBufA, symbolBufB, tb) {
             tb.validMask, tb.blockSums, symbolBufB, symbolBufA, tb.iterState,
         ]),
 
-        // Update count + indirect dispatch
+        // Update count + indirect dispatch (reads staged total from IterState._pad1)
         updateCount: bg(p.bpe_update_count, [
-            tb.totalValid, tb.iterState, tb.indirectDispatch,
+            tb.iterState, tb.indirectDispatch,
         ]),
     };
 }
@@ -401,17 +395,15 @@ function encodeBatch(cmd, pipelines, bg, batchMerges, maxDispatch, maxBlocks, fi
         encodePass(cmd, p.bpe_find_max_pair_final, bg.findMax2, 1);
         encodePass(cmd, p.bpe_setup_merge, bg.setupMerge, 1);
 
-        // Phase B: fillValid → merge → prefixReduce → prefixScan → finalizeCompact → updateCount
+        // Phase B: merge → prefixReduce → scan → finalizeCompact → updateCount
         // All dynamic kernels use indirect dispatch (except first iteration)
         if (i === 0) {
-            encodePass(cmd, p.bpe_fill_valid_b, bg.fillValid, maxDispatch);
             encodePass(cmd, p.bpe_merge_b, even ? bg.mergeA : bg.mergeB, maxDispatch);
             encodePass(cmd, p.bpe_prefix_sum_reduce_b, bg.prefixReduce, maxBlocks);
             encodePass(cmd, p.bpe_prefix_sum_scan_blocks_b, bg.prefixScan, 1);
             encodePass(cmd, p.bpe_finalize_compact_b,
                 even ? bg.finalizeCompactAB : bg.finalizeCompactBA, maxDispatch);
         } else {
-            encodeIndirectPass(cmd, p.bpe_fill_valid_b, bg.fillValid, indirectBuf);
             encodeIndirectPass(cmd, p.bpe_merge_b, even ? bg.mergeA : bg.mergeB, indirectBuf);
             encodeIndirectPass(cmd, p.bpe_prefix_sum_reduce_b, bg.prefixReduce, indirectBuf);
             encodePass(cmd, p.bpe_prefix_sum_scan_blocks_b, bg.prefixScan, 1);

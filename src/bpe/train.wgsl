@@ -7,19 +7,18 @@
  * at those markers and compiles each kernel as a separate GPUShaderModule,
  * prepending the shared utility section (everything before the first marker).
  *
- * Kernels (12):
+ * Kernels (11):
  *   1. bpe_word_boundary         — GPU pre-tokenization (word boundary detection)
  *   2. bpe_clear_table           — Hash table reset
  *   3. bpe_find_max_pair         — Block-level max reduction
  *   4. bpe_find_max_pair_final   — Final max reduction (single workgroup)
  *   5. bpe_setup_merge           — GPU-driven merge orchestrator
  *   6. bpe_pair_count_b          — Batched two-level pair counting
- *   7. bpe_fill_valid_b          — Batched valid mask initialization
- *   8. bpe_merge_b               — Batched pair merge
- *   9. bpe_prefix_sum_reduce_b   — Batched prefix sum reduce
- *  10. bpe_prefix_sum_scan_blocks_b — Batched sequential block scan
- *  11. bpe_finalize_compact_b    — Fused Blelloch scan + scatter
- *  12. bpe_update_count          — Symbol count update + indirect dispatch
+ *   7. bpe_merge_b               — Fused fill_valid + pair merge (race-free self-validity)
+ *   8. bpe_prefix_sum_reduce_b   — Batched prefix sum reduce
+ *   9. bpe_prefix_sum_scan_blocks_b — Block scan (stages total to IterState._pad1)
+ *  10. bpe_finalize_compact_b    — Fused Blelloch scan + scatter
+ *  11. bpe_update_count          — Symbol count update + indirect dispatch (reads _pad1)
  */
 
 // ════════════════════════════════════════════════════════════
@@ -372,20 +371,12 @@ fn bpe_pair_count_b(
     }
 }
 
-// --- KERNEL: bpe_fill_valid_b ---
-
-@group(0) @binding(0) var<storage, read_write> valid_mask: array<u32>;
-@group(0) @binding(1) var<storage, read> state: IterState;
-
-@compute @workgroup_size(256)
-fn bpe_fill_valid_b(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    if (state.early_stop != 0u) { return; }
-    let id = flat_id(gid, nwg);
-    if (id >= state.symbol_count) { return; }
-    valid_mask[id] = 1u;
-}
-
 // --- KERNEL: bpe_merge_b ---
+//
+// Fused fill_valid + merge: each thread writes its OWN valid_mask[id].
+// A thread is invalid (valid=0) only if it is the B-side of a matching pair.
+// The A-side thread writes the merged symbol. No cross-thread valid_mask
+// writes — completely race-free without global barriers.
 
 @group(0) @binding(0) var<storage, read_write> symbols: array<u32>;
 @group(0) @binding(1) var<storage, read_write> valid_mask: array<u32>;
@@ -395,17 +386,33 @@ fn bpe_fill_valid_b(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_
 fn bpe_merge_b(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     if (state.early_stop != 0u) { return; }
     let id = flat_id(gid, nwg);
-    if (id + 1u >= state.symbol_count) { return; }
+    if (id >= state.symbol_count) { return; }
 
-    let raw_a = symbols[id];
-    let raw_b = symbols[id + 1u];
-    if ((raw_b & WORD_START_BIT) != 0u) { return; }
+    let raw = symbols[id];
 
-    if ((raw_a & TOKEN_MASK) == state.symbol_a && (raw_b & TOKEN_MASK) == state.symbol_b) {
-        let flag = raw_a & WORD_START_BIT;
-        symbols[id] = state.new_symbol | flag;
-        valid_mask[id + 1u] = 0u;
+    // ── A-side: check if (id, id+1) is the winning pair → write merged symbol ──
+    if (id + 1u < state.symbol_count) {
+        let raw_b = symbols[id + 1u];
+        if ((raw_b & WORD_START_BIT) == 0u
+            && (raw & TOKEN_MASK) == state.symbol_a
+            && (raw_b & TOKEN_MASK) == state.symbol_b) {
+            let flag = raw & WORD_START_BIT;
+            symbols[id] = state.new_symbol | flag;
+        }
     }
+
+    // ── Self-validity: am I the B-side of a merge? ──
+    // Check if (id-1, id) matches the winning pair → I'm consumed → valid=0
+    var valid: u32 = 1u;
+    if (id > 0u) {
+        let raw_prev = symbols[id - 1u];
+        if ((raw & WORD_START_BIT) == 0u
+            && (raw_prev & TOKEN_MASK) == state.symbol_a
+            && (raw & TOKEN_MASK) == state.symbol_b) {
+            valid = 0u;
+        }
+    }
+    valid_mask[id] = valid;
 }
 
 // --- KERNEL: bpe_prefix_sum_reduce_b ---
@@ -437,14 +444,21 @@ fn bpe_prefix_sum_reduce_b(
 }
 
 // --- KERNEL: bpe_prefix_sum_scan_blocks_b ---
+//
+// Sequential exclusive prefix scan over block_sums (single thread).
+// Writes total valid count to state._pad1 (staging field) instead of a
+// separate buffer — eliminates the total_valid buffer entirely.
+// Cannot update state.symbol_count here because finalize_compact_b
+// runs next and needs the OLD symbol_count.
 
 @group(0) @binding(0) var<storage, read_write> block_sums: array<u32>;
-@group(0) @binding(1) var<storage, read_write> total_valid: array<u32>;
-@group(0) @binding(2) var<storage, read> state: IterState;
+@group(0) @binding(1) var<storage, read_write> state: IterState;
 
 @compute @workgroup_size(1)
 fn bpe_prefix_sum_scan_blocks_b(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x != 0u) { return; }
+    if (state.early_stop != 0u) { return; }
+
     let block_count = (state.symbol_count + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
     var sum: u32 = 0u;
     for (var i: u32 = 0u; i < block_count; i++) {
@@ -452,7 +466,8 @@ fn bpe_prefix_sum_scan_blocks_b(@builtin(global_invocation_id) gid: vec3<u32>) {
         block_sums[i] = sum;
         sum += v;
     }
-    total_valid[0] = sum;
+    // Stage new count in _pad1 — consumed by bpe_update_count after compact
+    state._pad1 = sum;
 }
 
 // --- KERNEL: bpe_finalize_compact_b ---
@@ -526,25 +541,23 @@ fn bpe_finalize_compact_b(
 
 // --- KERNEL: bpe_update_count ---
 //
-// After compact: updates symbol_count AND computes indirect dispatch params
-// for the next iteration. This ensures all dynamic kernels dispatch only
-// the workgroups needed for the current (shrinking) symbol count.
+// After compact: reads new symbol count from state._pad1 (staged by
+// scan_blocks), updates symbol_count, and computes indirect dispatch
+// params for the next iteration. Eliminates the total_valid buffer —
+// the value is passed through IterState padding.
 //
 // Indirect buffer layout: [wgX, wgY, wgZ] (3 × u32)
-// Follows WebGPU dispatchWorkgroupsIndirect format.
 
-@group(0) @binding(0) var<storage, read> total_valid: array<u32>;
-@group(0) @binding(1) var<storage, read_write> state: IterState;
-@group(0) @binding(2) var<storage, read_write> indirect: array<u32>;
+@group(0) @binding(0) var<storage, read_write> state: IterState;
+@group(0) @binding(1) var<storage, read_write> indirect: array<u32>;
 
 @compute @workgroup_size(1)
 fn bpe_update_count(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (state.early_stop != 0u) { return; }
 
-    let new_count = total_valid[0];
+    let new_count = state._pad1;
     state.symbol_count = new_count;
 
-    // Compute dispatch params for next iteration
     let total_wg = (new_count + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
     if (total_wg <= MAX_WG_DIM) {
         indirect[0] = max(total_wg, 1u);
