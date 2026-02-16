@@ -1,13 +1,25 @@
 /**
- * @file bpe.wgsl
- * @brief GPU-Native BPE Pipeline — Training + Inference (WebGPU/WGSL)
+ * @file train.wgsl
+ * @brief GPU-Native BPE Training Pipeline (WebGPU/WGSL)
  *
- * Ported from Metal (bpe.metal). Each kernel is delimited by
+ * Training kernels for BPE vocabulary learning. Each kernel is delimited by
  * "// --- KERNEL: <name> ---" markers. The JS host splits this file
  * at those markers and compiles each kernel as a separate GPUShaderModule,
  * prepending the shared utility section (everything before the first marker).
  *
- * Training Kernels (1-11) + Inference Kernels (12-13).
+ * Kernels (12):
+ *   1. bpe_word_boundary         — GPU pre-tokenization (word boundary detection)
+ *   2. bpe_clear_table           — Hash table reset
+ *   3. bpe_find_max_pair         — Block-level max reduction
+ *   4. bpe_find_max_pair_final   — Final max reduction (single workgroup)
+ *   5. bpe_setup_merge           — GPU-driven merge orchestrator
+ *   6. bpe_pair_count_b          — Batched two-level pair counting
+ *   7. bpe_fill_valid_b          — Batched valid mask initialization
+ *   8. bpe_merge_b               — Batched pair merge
+ *   9. bpe_prefix_sum_reduce_b   — Batched prefix sum reduce
+ *  10. bpe_prefix_sum_scan_blocks_b — Batched sequential block scan
+ *  11. bpe_finalize_compact_b    — Fused Blelloch scan + scatter
+ *  12. bpe_update_count          — Symbol count update + indirect dispatch
  */
 
 // ════════════════════════════════════════════════════════════
@@ -58,7 +70,7 @@ fn flat_id(gid: vec3<u32>, nwg: vec3<u32>) -> u32 {
     return gid.x + gid.y * nwg.x * WORKGROUP_SIZE;
 }
 
-// Local hash table constants (shared by bpe_pair_count and bpe_pair_count_b)
+// Local hash table constants for bpe_pair_count_b
 const LOCAL_TABLE_SIZE: u32 = 512u;
 const LOCAL_TABLE_MASK: u32 = 511u;  // power-of-2 modulo
 const LOCAL_MAX_PROBE: u32 = 64u;
@@ -164,88 +176,20 @@ fn bpe_word_boundary(
     // else: tok stays as-is (lower 16 bits only)
 }
 
-// --- KERNEL: bpe_pair_count ---
-//
-// Optimization: Two-level hashing to reduce global atomic contention.
-// Phase 1: Each workgroup aggregates pair counts into a LOCAL shared-memory
-//          hash table (512 entries, power-of-2). Shared memory atomics are
-//          10-100x faster than global memory atomics.
-// Phase 2: Flush non-zero local entries to the global hash table.
-//
-// WORD BOUNDARY: Pairs where the second symbol has WORD_START_BIT set
-// are SKIPPED — no cross-word merges allowed.
+// --- KERNEL: bpe_clear_table ---
 
-// (LOCAL_TABLE constants moved to preamble)
+struct ClearParams { table_size: u32, _pad: u32 }
 
-struct PairCountParams { symbol_count: u32, table_size: u32 }
+@group(0) @binding(0) var<storage, read_write> pair_counts: array<u32>;
+@group(0) @binding(1) var<storage, read_write> pair_ids: array<u32>;
+@group(0) @binding(2) var<uniform> params: ClearParams;
 
-@group(0) @binding(0) var<storage, read> symbols: array<u32>;
-@group(0) @binding(1) var<storage, read_write> pair_counts: array<atomic<u32>>;
-@group(0) @binding(2) var<storage, read_write> pair_ids: array<atomic<u32>>;
-@group(0) @binding(3) var<uniform> params: PairCountParams;
-
-var<workgroup> local_ids: array<atomic<u32>, 512>;
-var<workgroup> local_counts: array<atomic<u32>, 512>;
-
-/// Counts adjacent symbol pairs within words using a two-level hashing strategy.
-///
-/// This kernel reduces global memory contention by first aggregating pair counts
-/// in a workgroup-local hash table before flushing them to the global hash table.
-/// Pairs that cross word boundaries (indicated by WORD_START_BIT) are ignored.
 @compute @workgroup_size(256)
-fn bpe_pair_count(
-    @builtin(global_invocation_id) gid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(num_workgroups) nwg: vec3<u32>
-) {
-    // Phase 0: Clear local table (256 threads clear 512 entries)
-    atomicStore(&local_ids[lid.x], 0u);
-    atomicStore(&local_counts[lid.x], 0u);
-    atomicStore(&local_ids[lid.x + 256u], 0u);
-    atomicStore(&local_counts[lid.x + 256u], 0u);
-    workgroupBarrier();
-
-    // Phase 1: Aggregate into LOCAL shared-memory table
+fn bpe_clear_table(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let id = flat_id(gid, nwg);
-    if (id + 1u < params.symbol_count) {
-        let raw_b = symbols[id + 1u];
-        // Skip if next symbol starts a new word (boundary guard)
-        if ((raw_b & WORD_START_BIT) == 0u) {
-            let a = symbols[id] & TOKEN_MASK;
-            let b = raw_b & TOKEN_MASK;
-            if (a != 0u && b != 0u) {
-                let pid = pack_pair(a, b);
-                let h = pair_hash(pid);   // Murmur3 finalizer — better avalanche, less probe divergence
-                for (var probe: u32 = 0u; probe < LOCAL_MAX_PROBE; probe++) {
-                    let idx = (h + (probe * (probe + 1u)) / 2u) & LOCAL_TABLE_MASK;
-                    let r = atomicCompareExchangeWeak(&local_ids[idx], 0u, pid);
-                    if (r.exchanged || r.old_value == pid) {
-                        atomicAdd(&local_counts[idx], 1u);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    workgroupBarrier();
-
-    // Phase 2: Flush local table → global table (256 threads flush 512 entries)
-    for (var slot: u32 = lid.x; slot < LOCAL_TABLE_SIZE; slot += WORKGROUP_SIZE) {
-        let cnt = atomicLoad(&local_counts[slot]);
-        if (cnt == 0u) { continue; }
-        let pid = atomicLoad(&local_ids[slot]);
-        if (pid == 0u) { continue; }
-        let table_mask = params.table_size - 1u;
-        let hash = pair_hash(pid) & table_mask;
-        for (var probe: u32 = 0u; probe < MAX_PROBE; probe++) {
-            let idx = (hash + (probe * (probe + 1u)) / 2u) & table_mask;
-            let r = atomicCompareExchangeWeak(&pair_ids[idx], 0u, pid);
-            if (r.exchanged || r.old_value == pid) {
-                atomicAdd(&pair_counts[idx], cnt);  // flush aggregated count
-                break;
-            }
-        }
-    }
+    if (id >= params.table_size) { return; }
+    pair_counts[id] = 0u;
+    pair_ids[id] = 0u;
 }
 
 // --- KERNEL: bpe_find_max_pair ---
@@ -316,324 +260,6 @@ fn bpe_find_max_pair_final(@builtin(local_invocation_id) lid: vec3<u32>) {
     if (lid.x == 0u) { max_count[0] = sh_c[0]; max_pair_id[0] = sh_p[0]; }
 }
 
-// --- KERNEL: bpe_merge ---
-//
-// Merges pairs while respecting word boundaries:
-// - Only merge if both symbols match AND the second symbol is NOT a word-start.
-// - The merged symbol inherits the word-start flag from the first symbol.
-
-struct MergeParams { symbol_a: u32, symbol_b: u32, new_symbol: u32, symbol_count: u32 }
-
-@group(0) @binding(0) var<storage, read_write> symbols: array<u32>;
-@group(0) @binding(1) var<storage, read_write> valid_mask: array<u32>;
-@group(0) @binding(2) var<uniform> params: MergeParams;
-
-@compute @workgroup_size(256)
-fn bpe_merge(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let id = flat_id(gid, nwg);
-    if (id + 1u >= params.symbol_count) { return; }
-
-    let raw_a = symbols[id];
-    let raw_b = symbols[id + 1u];
-
-    // Don't merge across word boundaries
-    if ((raw_b & WORD_START_BIT) != 0u) { return; }
-
-    if ((raw_a & TOKEN_MASK) == params.symbol_a && (raw_b & TOKEN_MASK) == params.symbol_b) {
-        // Preserve word-start flag from first symbol
-        let flag = raw_a & WORD_START_BIT;
-        symbols[id] = params.new_symbol | flag;
-        valid_mask[id + 1u] = 0u;
-    }
-}
-
-// --- KERNEL: bpe_prefix_sum_reduce ---
-
-struct CountParams { count: u32, _pad: u32 }
-
-@group(0) @binding(0) var<storage, read> valid_mask: array<u32>;
-@group(0) @binding(1) var<storage, read_write> block_sums: array<u32>;
-@group(0) @binding(2) var<uniform> params: CountParams;
-
-var<workgroup> sh_data: array<u32, 256>;
-
-@compute @workgroup_size(256)
-fn bpe_prefix_sum_reduce(
-    @builtin(global_invocation_id) gid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) tgid: vec3<u32>,
-    @builtin(num_workgroups) nwg: vec3<u32>
-) {
-    let fid = flat_id(gid, nwg);
-    let block_idx = tgid.x + tgid.y * nwg.x;
-    var v: u32 = 0u;
-    if (fid < params.count) { v = valid_mask[fid] & 1u; }
-    sh_data[lid.x] = v;
-    workgroupBarrier();
-    for (var s: u32 = 128u; s > 0u; s >>= 1u) {
-        if (lid.x < s) { sh_data[lid.x] += sh_data[lid.x + s]; }
-        workgroupBarrier();
-    }
-    if (lid.x == 0u) { block_sums[block_idx] = sh_data[0]; }
-}
-
-// --- KERNEL: bpe_prefix_sum_scan_blocks ---
-
-struct ScanParams { block_count: u32, _pad: u32 }
-
-@group(0) @binding(0) var<storage, read_write> block_sums: array<u32>;
-@group(0) @binding(1) var<storage, read_write> total_valid: array<u32>;
-@group(0) @binding(2) var<uniform> params: ScanParams;
-
-@compute @workgroup_size(1)
-fn bpe_prefix_sum_scan_blocks(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x != 0u) { return; }
-    var sum: u32 = 0u;
-    for (var i: u32 = 0u; i < params.block_count; i++) {
-        let v = block_sums[i];
-        block_sums[i] = sum;
-        sum += v;
-    }
-    total_valid[0] = sum;
-}
-
-// --- KERNEL: bpe_prefix_sum_finalize ---
-
-struct CountParams2 { count: u32, _pad: u32 }
-
-@group(0) @binding(0) var<storage, read> valid_mask: array<u32>;
-@group(0) @binding(1) var<storage, read_write> prefix_sum: array<u32>;
-@group(0) @binding(2) var<storage, read> block_sums: array<u32>;
-@group(0) @binding(3) var<uniform> params: CountParams2;
-
-var<workgroup> sh_data: array<u32, 256>;
-
-@compute @workgroup_size(256)
-fn bpe_prefix_sum_finalize(
-    @builtin(global_invocation_id) gid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) tgid: vec3<u32>,
-    @builtin(num_workgroups) nwg: vec3<u32>
-) {
-    let fid = flat_id(gid, nwg);
-    let block_idx = tgid.x + tgid.y * nwg.x;
-    var v: u32 = 0u;
-    if (fid < params.count) { v = valid_mask[fid] & 1u; }
-
-    // Blelloch exclusive prefix sum in workgroup sh_data memory
-    sh_data[lid.x] = v;
-    workgroupBarrier();
-
-    // Up-sweep
-    for (var d: u32 = 1u; d < WORKGROUP_SIZE; d <<= 1u) {
-        let idx = (lid.x + 1u) * (d << 1u) - 1u;
-        if (idx < WORKGROUP_SIZE) { sh_data[idx] += sh_data[idx - d]; }
-        workgroupBarrier();
-    }
-    if (lid.x == 0u) { sh_data[WORKGROUP_SIZE - 1u] = 0u; }
-    workgroupBarrier();
-
-    // Down-sweep
-    for (var d: u32 = WORKGROUP_SIZE >> 1u; d > 0u; d >>= 1u) {
-        let idx = (lid.x + 1u) * (d << 1u) - 1u;
-        if (idx < WORKGROUP_SIZE) {
-            let t = sh_data[idx - d];
-            sh_data[idx - d] = sh_data[idx];
-            sh_data[idx] += t;
-        }
-        workgroupBarrier();
-    }
-
-    if (fid < params.count) {
-        prefix_sum[fid] = block_sums[block_idx] + sh_data[lid.x];
-    }
-}
-
-// --- KERNEL: bpe_compact ---
-
-struct CompactParams { input_count: u32, _pad: u32 }
-
-@group(0) @binding(0) var<storage, read> input_symbols: array<u32>;
-@group(0) @binding(1) var<storage, read> valid_mask: array<u32>;
-@group(0) @binding(2) var<storage, read_write> output_symbols: array<u32>;
-@group(0) @binding(3) var<storage, read> prefix_sum: array<u32>;
-@group(0) @binding(4) var<uniform> params: CompactParams;
-
-@compute @workgroup_size(256)
-fn bpe_compact(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let id = flat_id(gid, nwg);
-    if (id >= params.input_count) { return; }
-    if ((valid_mask[id] & 1u) == 1u) {
-        output_symbols[prefix_sum[id]] = input_symbols[id];
-    }
-}
-
-// --- KERNEL: bpe_clear_table ---
-
-struct ClearParams { table_size: u32, _pad: u32 }
-
-@group(0) @binding(0) var<storage, read_write> pair_counts: array<u32>;
-@group(0) @binding(1) var<storage, read_write> pair_ids: array<u32>;
-@group(0) @binding(2) var<uniform> params: ClearParams;
-
-@compute @workgroup_size(256)
-fn bpe_clear_table(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let id = flat_id(gid, nwg);
-    if (id >= params.table_size) { return; }
-    pair_counts[id] = 0u;
-    pair_ids[id] = 0u;
-}
-
-// --- KERNEL: bpe_fill_valid_mask ---
-
-struct FillParams { count: u32, _pad: u32 }
-
-@group(0) @binding(0) var<storage, read_write> valid_mask: array<u32>;
-@group(0) @binding(1) var<uniform> params: FillParams;
-
-@compute @workgroup_size(256)
-fn bpe_fill_valid_mask(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let id = flat_id(gid, nwg);
-    if (id >= params.count) { return; }
-    valid_mask[id] = 1u;
-}
-
-// NOTE: Unicode preprocessing kernels (bpe_normalize_bytes, bpe_unicode_preprocess,
-//       bpe_codepoint_to_symbol) have been removed. Text normalization is now
-//       handled by the Decoder WASM module (Unicode 17.0 NFC) before training.
-
-// --- KERNEL: trie_tokenizer_chunked ---
-//
-// Optimization: Cache root node's edge table in shared memory.
-// Root (node 0) is accessed on EVERY token match restart — caching its
-// edges eliminates repeated global memory pointer-chasing for the
-// most frequently accessed trie level. With a byte-level trie,
-// root has up to 256 children → 512 u32s (2KB) in shared memory.
-
-const MAX_CACHED_EDGES: u32 = 256u;
-
-struct TrieParams { input_length: u32, chunk_size: u32, max_tokens_per_chunk: u32, _pad: u32 }
-
-@group(0) @binding(0) var<storage, read> input: array<u32>;
-@group(0) @binding(1) var<storage, read> nodes: array<u32>;  // 3 x u32 per node
-@group(0) @binding(2) var<storage, read> edges: array<u32>;  // 2 x u32 per edge
-@group(0) @binding(3) var<storage, read_write> token_output: array<u32>;
-@group(0) @binding(4) var<storage, read_write> chunk_counts: array<u32>;
-@group(0) @binding(5) var<uniform> params: TrieParams;
-
-// O(1) Root LUT: Direct byte→node lookup table in shared memory.
-// Replaces binary search (up to 8 iterations, warp divergence)
-// with a single branchless array read.
-var<workgroup> root_lut: array<u32, 256>;
-var<workgroup> cached_root_fc: u32;                 // root firstChild
-var<workgroup> cached_root_nc: u32;                 // root numChildren
-
-/// Find child using global memory (non-root nodes).
-/// Branchless lower_bound: `select()` compiles to predication — no SIMD
-/// mask split, no warp divergence. All threads execute the same number
-/// of iterations (⌈log₂(num)⌉), trading early-exit for uniform execution.
-fn find_child_global(first: u32, num: u32, sym: u32) -> u32 {
-    var lo: u32 = 0u;
-    var n: u32 = num;
-    while (n > 0u) {
-        let half = n >> 1u;
-        let mid = lo + half;
-        let less = (edges[(first + mid) * 2u] & 0xFFu) < sym;
-        lo = select(lo, mid + 1u, less);
-        n = select(half, n - half - 1u, less);
-    }
-    if (lo < num) {
-        let slot = (first + lo) * 2u;
-        if ((edges[slot] & 0xFFu) == sym) {
-            return edges[slot + 1u];
-        }
-    }
-    return INVALID_TOKEN;
-}
-
-@compute @workgroup_size(256)
-fn trie_tokenizer_chunked(
-    @builtin(global_invocation_id) gid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    // Build O(1) root LUT: 256 threads fill 256 slots
-    // Step 1: Initialize all slots to INVALID (no child for this byte)
-    root_lut[lid.x] = INVALID_TOKEN;
-    if (lid.x == 0u) {
-        cached_root_fc = nodes[0];                    // root.firstChild
-        cached_root_nc = nodes[1] & 0xFFFFu;          // root.numChildren
-    }
-    workgroupBarrier();
-    // Step 2: Scatter valid edges into LUT by byte value
-    let nc = min(cached_root_nc, MAX_CACHED_EDGES);
-    let fc = cached_root_fc;
-    if (lid.x < nc) {
-        let sym = edges[(fc + lid.x) * 2u] & 0xFFu;
-        root_lut[sym] = edges[(fc + lid.x) * 2u + 1u];  // Direct: byte → target node
-    }
-    workgroupBarrier();
-
-    // Main tokenization loop
-    let id = gid.x;
-    let cs = id * params.chunk_size;
-    if (cs >= params.input_length) { chunk_counts[id] = 0u; return; }
-    let ce = min(cs + params.chunk_size, params.input_length);
-    let ob = id * params.max_tokens_per_chunk;
-    var tw: u32 = 0u; var pos = cs;
-
-    while (pos < ce && tw < params.max_tokens_per_chunk) {
-        var cn: u32 = 0u; var lmt: u32 = INVALID_TOKEN; var lmp = pos; var wp = pos;
-        while (wp < ce) {
-            let bv = input[wp] & 0xFFu;
-            var nn: u32;
-            if (cn == 0u) {
-                // O(1) direct LUT lookup — branchless, no divergence
-                nn = root_lut[bv];
-            } else {
-                // Normal path: global memory lookup
-                let nfc = nodes[cn * 3u]; let nnc = nodes[cn * 3u + 1u] & 0xFFFFu;
-                nn = find_child_global(nfc, nnc, bv);
-            }
-            if (nn == INVALID_TOKEN) { break; }
-            cn = nn; wp++;
-            let ti = nodes[cn * 3u + 2u];
-            if (ti != INVALID_TOKEN) { lmt = ti; lmp = wp; }
-        }
-        if (lmt != INVALID_TOKEN) {
-            token_output[ob + tw] = lmt; tw++; pos = lmp;
-        } else {
-            token_output[ob + tw] = input[pos] & 0xFFu; tw++; pos++;
-        }
-    }
-    chunk_counts[id] = tw;
-}
-
-// --- KERNEL: trie_tokenizer_compact ---
-
-struct CompactTrieParams { max_tokens_per_chunk: u32, _pad: u32 }
-
-@group(0) @binding(0) var<storage, read> chunked_tokens: array<u32>;
-@group(0) @binding(1) var<storage, read> chunk_counts: array<u32>;
-@group(0) @binding(2) var<storage, read> chunk_offsets: array<u32>;
-@group(0) @binding(3) var<storage, read_write> compact_output: array<u32>;
-@group(0) @binding(4) var<uniform> params: CompactTrieParams;
-
-@compute @workgroup_size(256)
-fn trie_tokenizer_compact(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let id = gid.x;
-    let cnt = chunk_counts[id];
-    if (cnt == 0u) { return; }
-    let sb = id * params.max_tokens_per_chunk;
-    let db = chunk_offsets[id];
-    for (var i: u32 = 0u; i < cnt; i++) {
-        compact_output[db + i] = chunked_tokens[sb + i];
-    }
-}
-
-// NOTE: Legacy GPU vocab management kernels (vocab_merge, check_early_stop) removed.
-// Vocab management is handled CPU-side in Vocab.addMerge().
-// Early stop logic is integrated into bpe_setup_merge.
-
 // ════════════════════════════════════════════════════════════
 // BATCHED TRAINING KERNELS — GPU-driven merge loop
 //
@@ -670,7 +296,7 @@ fn bpe_setup_merge(@builtin(global_invocation_id) gid: vec3<u32>) {
     state.max_count = mc;
     state.new_symbol = state.next_token_id;
 
-    // Log for CPU vocab reconstruction: [pair, newTokenId]
+    // Log for CPU vocab reconstruction: [pair, newTokenId, count]
     let log_idx = state.merges_done * 3u;
     merge_log[log_idx]      = pair;
     merge_log[log_idx + 1u] = state.next_token_id;

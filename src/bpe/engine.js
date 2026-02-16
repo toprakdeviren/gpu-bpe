@@ -21,7 +21,7 @@ export const GPU_LIMITS = Object.freeze({
     MAX_COMPUTE_WORKGROUPS_PER_DIM: MAX_WG_DIM,
 });
 
-const SHADER_PATH = './bpe.wgsl';
+const SHADER_PATHS = ['./train.wgsl', './tokenize.wgsl'];
 
 // ─── Dispatch Helper ────────────────────────────────────────
 
@@ -83,11 +83,12 @@ function splitKernels(source) {
 // ─── Shader Loading ─────────────────────────────────────────
 
 /**
+ * @param {string} path - Shader file path (relative to baseUrl)
  * @param {string} baseUrl - import.meta.url of the calling module
  * @returns {Promise<string>}
  */
-async function loadShaderSource(baseUrl) {
-    const url = new URL(SHADER_PATH, baseUrl);
+async function loadShaderSource(path, baseUrl) {
+    const url = new URL(path, baseUrl);
     url.searchParams.set('v', Date.now());   // cache-bust
 
     try {
@@ -194,9 +195,14 @@ export class BPEEngine {
 
         this.#device = await requestGPUDevice();
 
-        const shaderSource = await loadShaderSource(import.meta.url);
-        const kernelSources = splitKernels(shaderSource);
-        this.#pipelines = await compilePipelines(this.#device, kernelSources);
+        // Load and compile all shader modules (train + tokenize)
+        const allKernels = {};
+        for (const path of SHADER_PATHS) {
+            const source = await loadShaderSource(path, import.meta.url);
+            const kernels = splitKernels(source);
+            Object.assign(allKernels, kernels);
+        }
+        this.#pipelines = await compilePipelines(this.#device, allKernels);
 
         this.#initialized = true;
 
