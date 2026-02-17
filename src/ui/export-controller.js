@@ -1,5 +1,5 @@
 import { $, formatSize } from '../utils.js';
-import { TrieTokenizer } from '../bpe/tokenizer.js';
+import { TrieTokenizer } from '../bpe/tokenizer/tokenizer.js';
 
 const MAGIC = 0x44584654; // 'DXFT' — Decoder eXport Format Tokens
 

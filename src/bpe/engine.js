@@ -16,12 +16,12 @@ const MB = 1024 * 1024;
 
 /** @readonly */
 export const GPU_LIMITS = Object.freeze({
-    MAX_STORAGE_BUFFER_SIZE: 512 * MB,
-    MAX_BUFFER_SIZE: 512 * MB,
+    MAX_STORAGE_BUFFER_SIZE: 512 * MB,      // default fallback
+    MAX_BUFFER_SIZE: 512 * MB,              // default fallback
     MAX_COMPUTE_WORKGROUPS_PER_DIM: MAX_WG_DIM,
 });
 
-const SHADER_PATHS = ['./train.wgsl', './tokenize.wgsl'];
+const SHADER_PATHS = ['./train.wgsl', './tokenizer/tokenize.wgsl'];
 
 // ─── Dispatch Helper ────────────────────────────────────────
 
@@ -138,7 +138,7 @@ async function compilePipelines(device, kernelSources) {
 // ─── Device Initialization ──────────────────────────────────
 
 /**
- * @returns {Promise<GPUDevice>}
+ * @returns {Promise<{ device: GPUDevice, limits: { maxBufferSize: number, maxStorageBufferBindingSize: number } }>}
  */
 async function requestGPUDevice() {
     if (!navigator.gpu) {
@@ -153,13 +153,27 @@ async function requestGPUDevice() {
         throw new Error('No WebGPU adapter found');
     }
 
-    return adapter.requestDevice({
+    // Query adapter's actual hardware limits
+    const adapterLimits = adapter.limits;
+    const rawMaxBuffer = Math.min(adapterLimits.maxBufferSize, 4 * 1024 * MB);
+    const rawMaxStorage = Math.min(adapterLimits.maxStorageBufferBindingSize, 4 * 1024 * MB);
+    // Effective limit: the SMALLER of the two (storage binding is often 4 bytes less than buffer max)
+    const effectiveMax = Math.min(rawMaxBuffer, rawMaxStorage);
+
+    const device = await adapter.requestDevice({
         requiredLimits: {
-            maxStorageBufferBindingSize: GPU_LIMITS.MAX_STORAGE_BUFFER_SIZE,
-            maxBufferSize: GPU_LIMITS.MAX_BUFFER_SIZE,
+            maxStorageBufferBindingSize: rawMaxStorage,
+            maxBufferSize: rawMaxBuffer,
             maxComputeWorkgroupsPerDimension: GPU_LIMITS.MAX_COMPUTE_WORKGROUPS_PER_DIM,
         },
     });
+
+    console.log(`  [gpu] maxBufferSize: ${(effectiveMax / MB).toFixed(0)} MB (buffer=${(rawMaxBuffer / MB).toFixed(0)}, storage=${(rawMaxStorage / MB).toFixed(0)})`);
+
+    return {
+        device,
+        limits: { maxBufferSize: effectiveMax },
+    };
 }
 
 // ─── BPE Engine ─────────────────────────────────────────────
@@ -174,6 +188,9 @@ export class BPEEngine {
     /** @type {boolean} */
     #initialized = false;
 
+    /** @type {{ maxBufferSize: number, maxStorageBufferBindingSize: number }} */
+    #limits = null;
+
     /** Read-only access to the GPU device */
     get device() {
         this.#assertInitialized();
@@ -186,6 +203,12 @@ export class BPEEngine {
         return this.#pipelines;
     }
 
+    /** Read-only access to runtime GPU limits */
+    get limits() {
+        this.#assertInitialized();
+        return this.#limits;
+    }
+
     /**
      * Initialize the engine: request device, load shader, compile pipelines.
      * @returns {Promise<this>}
@@ -193,7 +216,9 @@ export class BPEEngine {
     async init() {
         if (this.#initialized) return this;
 
-        this.#device = await requestGPUDevice();
+        const { device, limits } = await requestGPUDevice();
+        this.#device = device;
+        this.#limits = limits;
 
         // Load and compile all shader modules (train + tokenize)
         const allKernels = {};

@@ -1,111 +1,31 @@
 /**
  * BPE Trainer — GPU-accelerated BPE vocabulary training
  *
- * Manages the BPE training pipeline: word boundary detection, pair counting,
- * max pair finding, merging, and compaction.
+ * Manages the BPE training pipeline: input preparation, training loop,
+ * and vocab management. GPU orchestration delegated to training-pipeline.js.
  *
  * Text normalization (NFC, control chars, whitespace) is handled by the Decoder
  * WASM module before data is passed to the trainer.
  */
 
-import { WORKGROUP_SIZE, TABLE_SIZE, dispatch2D } from './engine.js';
+import { WORKGROUP_SIZE, TABLE_SIZE } from './engine.js';
+import { uploadBuffer } from './gpu-utils.js';
+import { Vocab } from './vocab.js';
+import {
+    BATCH_SIZE, MERGE_LOG_STRIDE, ITER_STATE_SIZE,
+    allocTrainingBuffers, destroyTrainingBuffers,
+    buildBindGroups, encodeBatch, encodePass,
+} from './training-pipeline.js';
 
 // ─── Constants ──────────────────────────────────────────────
 
 const WORD_START_BIT = 0x10000;       // bit 16 — must match WGSL constant
-const BATCH_SIZE = 128;
-const MERGE_LOG_STRIDE = 3;           // [pair, newTokenId, count] per merge
-const ITER_STATE_SIZE = 48;           // 12 × u32
 
 const BUFFER_USAGE = {
     STORAGE_SRC: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-    STORAGE_ALL: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    READBACK: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
 };
 
-// ─── Display Helpers ────────────────────────────────────────
-
-/**
- * Convert a byte sequence to a human-readable display string.
- * Tries UTF-8 decode; falls back to hex for non-printable/invalid bytes.
- * Space (0x20) is shown as '▁' for visibility.
- *
- * @param {number[]} bytes
- * @returns {string}
- */
-function bytesToDisplayString(bytes) {
-    const parts = [];
-    let i = 0;
-
-    while (i < bytes.length) {
-        const b = bytes[i];
-
-        // ASCII range
-        if (b < 0x80) {
-            parts.push(formatAsciiByte(b));
-            i++;
-            continue;
-        }
-
-        // Orphan continuation byte
-        if (b < 0xC0) {
-            parts.push(formatHexByte(b));
-            i++;
-            continue;
-        }
-
-        // Multi-byte UTF-8 start
-        const seqLen = b < 0xE0 ? 2 : b < 0xF0 ? 3 : 4;
-        const decoded = tryDecodeUtf8(bytes, i, seqLen);
-
-        if (decoded !== null) {
-            parts.push(decoded);
-            i += seqLen;
-        } else {
-            parts.push(formatHexByte(b));
-            i++;
-        }
-    }
-
-    return parts.join('');
-}
-
-/** @param {number} b */
-function formatAsciiByte(b) {
-    if (b === 0x20) return '▁';
-    if (b === 0x0A) return '\\n';
-    if (b >= 0x21 && b <= 0x7E) return String.fromCharCode(b);
-    return formatHexByte(b);
-}
-
-/** @param {number} b */
-function formatHexByte(b) {
-    return `<0x${b.toString(16).padStart(2, '0').toUpperCase()}>`;
-}
-
-/**
- * @param {number[]} bytes
- * @param {number} offset
- * @param {number} len
- * @returns {string|null}
- */
-function tryDecodeUtf8(bytes, offset, len) {
-    if (offset + len > bytes.length) return null;
-
-    // Validate continuation bytes
-    for (let j = 1; j < len; j++) {
-        if ((bytes[offset + j] & 0xC0) !== 0x80) return null;
-    }
-
-    try {
-        const slice = new Uint8Array(bytes.slice(offset, offset + len));
-        return new TextDecoder('utf-8', { fatal: true }).decode(slice);
-    } catch {
-        return null;
-    }
-}
-
-// ─── Time Formatting ────────────────────────────────────────
+// ─── Utilities ──────────────────────────────────────────────
 
 /** @param {number} seconds */
 function formatDuration(seconds) {
@@ -115,46 +35,12 @@ function formatDuration(seconds) {
     return s > 0 ? `${m}m ${s}s` : `${m}m`;
 }
 
-// ─── GPU Buffer Utilities ───────────────────────────────────
-
-/**
- * @param {GPUDevice} device
- * @param {TypedArray} data
- * @param {GPUBufferUsageFlags} usage
- * @returns {GPUBuffer}
- */
-function uploadBuffer(device, data, usage) {
-    const buf = device.createBuffer({
-        size: data.byteLength,
-        usage: usage | GPUBufferUsage.COPY_DST,
-        mappedAtCreation: true,
-    });
-    new data.constructor(buf.getMappedRange()).set(data);
-    buf.unmap();
-    return buf;
-}
-
-/**
- * @param {GPUDevice} device
- * @param {number} size
- * @param {GPUBufferUsageFlags} usage
- * @returns {GPUBuffer}
- */
-function allocBuffer(device, size, usage) {
-    return device.createBuffer({ size, usage });
-}
-
-/** @param {GPUBuffer[]} buffers */
-function destroyBuffers(buffers) {
-    for (const buf of buffers) buf.destroy();
-}
-
 /** Yield to event loop so browser can repaint */
 function yieldToEventLoop() {
     return new Promise(r => setTimeout(r, 0));
 }
 
-// ─── Bytes → Symbols ────────────────────────────────────────
+// ─── Input Preparation ──────────────────────────────────────
 
 /**
  * @param {Uint8Array} data
@@ -165,291 +51,6 @@ function bytesToSymbols(data) {
     for (let i = 0; i < data.length; i++) symbols[i] = data[i];
     return symbols;
 }
-
-// ─── Vocab ──────────────────────────────────────────────────
-
-class Vocab {
-    /** @type {number[][]} */
-    entries = [];
-    /** @type {string[]} */
-    strings = [];
-    /** @type {number} */
-    nextTokenId = 256;
-
-    constructor() {
-        // Initialize 256 single-byte base tokens
-        for (let i = 0; i < 256; i++) {
-            this.entries.push([i]);
-            this.strings.push(bytesToDisplayString([i]));
-        }
-    }
-
-    get size() {
-        return this.entries.length;
-    }
-
-    /**
-     * Register a new merged token
-     * @param {number} symbolA
-     * @param {number} symbolB
-     * @returns {number} newTokenId
-     */
-    addMerge(symbolA, symbolB) {
-        const newTokenId = this.nextTokenId++;
-        const merged = [...this.entries[symbolA], ...this.entries[symbolB]];
-        this.entries.push(merged);
-        this.strings.push(bytesToDisplayString(merged));
-        return newTokenId;
-    }
-
-    /**
-     * Export vocab as human-readable text
-     * @returns {string}
-     */
-    export() {
-        const lines = [
-            `# GPU BPE Vocabulary (WebGPU Trainer)`,
-            `# Total tokens: ${this.entries.length}`,
-            '',
-        ];
-
-        for (let i = 0; i < this.entries.length; i++) {
-            const bytes = this.entries[i].join(',');
-            lines.push(`${i}\t${this.strings[i]}\t[${bytes}]`);
-        }
-
-        return lines.join('\n') + '\n';
-    }
-}
-
-// ─── Training Buffers ───────────────────────────────────────
-
-/**
- * Pre-allocate all persistent GPU buffers needed during training.
- *
- * @param {GPUDevice} device
- * @param {number} maxSymbols
- * @returns {TrainingBuffers}
- */
-function allocTrainingBuffers(device, maxSymbols) {
-    const maxBlocks = Math.ceil(maxSymbols / WORKGROUP_SIZE);
-    // find_max_pair4: 4 elements/thread × 256 threads = 1024 entries/workgroup
-    const findMaxBlocks = Math.ceil(TABLE_SIZE / (256 * 4));
-    // Parallel scan handles up to 256 blocks (65,536 symbols); above that → sequential fallback
-    const useParallelScan = maxBlocks <= 256;
-
-    return {
-        // Hash table
-        pairCounts: allocBuffer(device, TABLE_SIZE * 4, BUFFER_USAGE.STORAGE_SRC),
-        pairIds: allocBuffer(device, TABLE_SIZE * 4, BUFFER_USAGE.STORAGE_SRC),
-
-        // FindMax reduction (4× fewer blocks thanks to find_max_pair4)
-        blockMaxCounts: allocBuffer(device, findMaxBlocks * 4, GPUBufferUsage.STORAGE),
-        blockMaxPairIds: allocBuffer(device, findMaxBlocks * 4, GPUBufferUsage.STORAGE),
-        maxCount: allocBuffer(device, 4, BUFFER_USAGE.STORAGE_SRC),
-        maxPairId: allocBuffer(device, 4, BUFFER_USAGE.STORAGE_SRC),
-
-        // Compaction (merge_reduce writes valid_mask + block_sums in one pass)
-        validMask: allocBuffer(device, maxSymbols * 4, GPUBufferUsage.STORAGE),
-        blockSums: allocBuffer(device, maxBlocks * 4, GPUBufferUsage.STORAGE),
-        compact: allocBuffer(device, maxSymbols * 4, BUFFER_USAGE.STORAGE_SRC),
-
-        // Batched iteration
-        iterState: allocBuffer(device, ITER_STATE_SIZE, BUFFER_USAGE.STORAGE_ALL),
-        mergeLog: allocBuffer(device, BATCH_SIZE * MERGE_LOG_STRIDE * 4, BUFFER_USAGE.STORAGE_SRC),
-
-        // Indirect dispatch buffer (3 × u32: wgX, wgY, wgZ)
-        // Written by scan_blocks kernel, read by dispatchWorkgroupsIndirect
-        indirectDispatch: allocBuffer(device, 12,
-            GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST),
-
-        // Readback staging
-        readbackState: allocBuffer(device, ITER_STATE_SIZE, BUFFER_USAGE.READBACK),
-        readbackLog: allocBuffer(device, BATCH_SIZE * MERGE_LOG_STRIDE * 4, BUFFER_USAGE.READBACK),
-
-        // Uniform param buffers
-        clearTableParam: uploadBuffer(device, new Uint32Array([TABLE_SIZE, 0]), GPUBufferUsage.UNIFORM),
-        findMaxParam1: uploadBuffer(device, new Uint32Array([TABLE_SIZE, 0]), GPUBufferUsage.UNIFORM),
-        findMaxParam2: uploadBuffer(device, new Uint32Array([findMaxBlocks, 0]), GPUBufferUsage.UNIFORM),
-
-        // Derived constants
-        maxBlocks,
-        findMaxBlocks,
-        maxSymbols,
-        useParallelScan,
-    };
-}
-
-/** @param {TrainingBuffers} b */
-function destroyTrainingBuffers(b) {
-    destroyBuffers([
-        b.pairCounts, b.pairIds,
-        b.blockMaxCounts, b.blockMaxPairIds,
-        b.maxCount, b.maxPairId,
-        b.validMask, b.blockSums, b.compact,
-        b.iterState, b.mergeLog, b.indirectDispatch,
-        b.readbackState, b.readbackLog,
-        b.clearTableParam, b.findMaxParam1, b.findMaxParam2,
-    ]);
-}
-
-// ─── Bind Group Factory ─────────────────────────────────────
-
-/**
- * Initialize all bind groups needed for batched training.
- *
- * @param {GPUDevice} device
- * @param {Record<string, GPUComputePipeline>} pipelines
- * @param {GPUBuffer} symbolBufA
- * @param {GPUBuffer} symbolBufB
- * @param {TrainingBuffers} tb
- * @returns {Record<string, GPUBindGroup>}
- */
-function buildBindGroups(device, pipelines, symbolBufA, symbolBufB, tb) {
-    const p = pipelines;
-
-    /** Helper to init a bind group with less boilerplate */
-    const bg = (pipeline, bindings) => device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
-        entries: bindings.map((buffer, binding) => ({ binding, resource: { buffer } })),
-    });
-
-    return {
-        clearTable: bg(p.bpe_clear_table, [
-            tb.pairCounts, tb.pairIds, tb.clearTableParam,
-        ]),
-
-        // Ping-pong pair counting
-        pairCountA: bg(p.bpe_pair_count_b, [
-            symbolBufA, tb.pairCounts, tb.pairIds, tb.iterState,
-        ]),
-        pairCountB: bg(p.bpe_pair_count_b, [
-            symbolBufB, tb.pairCounts, tb.pairIds, tb.iterState,
-        ]),
-
-        // Two-pass findMax (4 elem/thread, deterministic tie-breaking)
-        findMax1: bg(p.bpe_find_max_pair4, [
-            tb.pairCounts, tb.pairIds, tb.blockMaxCounts, tb.blockMaxPairIds, tb.findMaxParam1,
-        ]),
-        findMax2: bg(p.bpe_find_max_pair_final_det, [
-            tb.blockMaxCounts, tb.blockMaxPairIds, tb.maxCount, tb.maxPairId, tb.findMaxParam2,
-        ]),
-
-        // Merge setup
-        setupMerge: bg(p.bpe_setup_merge, [
-            tb.maxCount, tb.maxPairId, tb.iterState, tb.mergeLog,
-        ]),
-
-        // FUSED merge + reduce (ping-pong)
-        // Bindings: symbols, valid_mask, block_sums, state
-        mergeReduceA: bg(p.bpe_merge_reduce_b, [
-            symbolBufA, tb.validMask, tb.blockSums, tb.iterState,
-        ]),
-        mergeReduceB: bg(p.bpe_merge_reduce_b, [
-            symbolBufB, tb.validMask, tb.blockSums, tb.iterState,
-        ]),
-
-        // Parallel scan + update_count (primary path, ≤256 blocks)
-        // Bindings: block_sums, state, indirect
-        scanBlocksPar: bg(p.bpe_prefix_sum_scan_blocks_par, [
-            tb.blockSums, tb.iterState, tb.indirectDispatch,
-        ]),
-
-        // Sequential scan fallback (>256 blocks)
-        // Same binding layout: block_sums, state, indirect
-        scanBlocksSeq: bg(p.bpe_prefix_sum_scan_blocks_b, [
-            tb.blockSums, tb.iterState, tb.indirectDispatch,
-        ]),
-
-        // Fused finalize + compact (prefix_sum stays in registers)
-        finalizeCompactAB: bg(p.bpe_finalize_compact_b, [
-            tb.validMask, tb.blockSums, symbolBufA, symbolBufB, tb.iterState,
-        ]),
-        finalizeCompactBA: bg(p.bpe_finalize_compact_b, [
-            tb.validMask, tb.blockSums, symbolBufB, symbolBufA, tb.iterState,
-        ]),
-    };
-}
-
-// ─── Batch Encoding ─────────────────────────────────────────
-
-/**
- * Encode one batch of BPE merge iterations into a command encoder.
- *
- * Optimized pipeline (8 dispatches/iteration, down from 10):
- *   clear → count → findMax4 → findMaxFinal → setupMerge
- *   → mergeReduce (FUSED) → scanBlocksPar → finalizeCompact
- */
-function encodeBatch(cmd, pipelines, bg, batchMerges, maxDispatch, maxBlocks, findMaxBlocks, indirectBuf, useParallelScan) {
-    const p = pipelines;
-
-    // Choose scan kernel + bind group based on block count
-    const scanPipeline = useParallelScan
-        ? p.bpe_prefix_sum_scan_blocks_par
-        : p.bpe_prefix_sum_scan_blocks_b;
-    const scanBG = useParallelScan ? bg.scanBlocksPar : bg.scanBlocksSeq;
-
-    for (let i = 0; i < batchMerges; i++) {
-        const even = (i % 2 === 0);
-
-        // Phase A: clear → count → findMax4 → findMaxFinal → setupMerge
-        encodePass(cmd, p.bpe_clear_table, bg.clearTable,
-            Math.ceil(TABLE_SIZE / WORKGROUP_SIZE));
-
-        // First iteration uses static maxDispatch; subsequent use indirect buffer
-        if (i === 0) {
-            encodePass(cmd, p.bpe_pair_count_b, even ? bg.pairCountA : bg.pairCountB,
-                maxDispatch);
-        } else {
-            encodeIndirectPass(cmd, p.bpe_pair_count_b,
-                even ? bg.pairCountA : bg.pairCountB, indirectBuf);
-        }
-
-        encodePass(cmd, p.bpe_find_max_pair4, bg.findMax1, findMaxBlocks);
-        encodePass(cmd, p.bpe_find_max_pair_final_det, bg.findMax2, 1);
-        encodePass(cmd, p.bpe_setup_merge, bg.setupMerge, 1);
-
-        // Phase B: mergeReduce (FUSED) → scanBlocks → finalizeCompact
-        //          8 dispatches total (was 10)
-        if (i === 0) {
-            encodePass(cmd, p.bpe_merge_reduce_b,
-                even ? bg.mergeReduceA : bg.mergeReduceB, maxDispatch);
-            encodePass(cmd, scanPipeline, scanBG, useParallelScan ? 1 : 1);
-            encodePass(cmd, p.bpe_finalize_compact_b,
-                even ? bg.finalizeCompactAB : bg.finalizeCompactBA, maxDispatch);
-        } else {
-            encodeIndirectPass(cmd, p.bpe_merge_reduce_b,
-                even ? bg.mergeReduceA : bg.mergeReduceB, indirectBuf);
-            encodePass(cmd, scanPipeline, scanBG, 1);
-            encodeIndirectPass(cmd, p.bpe_finalize_compact_b,
-                even ? bg.finalizeCompactAB : bg.finalizeCompactBA, indirectBuf);
-        }
-    }
-}
-
-/**
- * Encode a single compute pass with indirect dispatch.
- */
-function encodeIndirectPass(cmd, pipeline, bindGroup, indirectBuffer) {
-    const pass = cmd.beginComputePass();
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroupsIndirect(indirectBuffer, 0);
-    pass.end();
-}
-
-/**
- * Encode a single compute pass.
- */
-function encodePass(cmd, pipeline, bindGroup, workgroups) {
-    const pass = cmd.beginComputePass();
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
-    dispatch2D(pass, workgroups);
-    pass.end();
-}
-
-// ─── Input Preparation ──────────────────────────────────────
 
 /**
  * Prepare input for training: pre-tokenize or fall back to byte-level.
@@ -487,8 +88,6 @@ async function prepareInput(input, preTokenizer) {
         const result = preTokenizer.preTokenize(input);
 
         if (result.bytes.length === 0 && input.length > 0) {
-            // PreTokenizer returned empty — WASM normalize may have failed on large input.
-            // Fall back to byte-level encoding so training can proceed.
             console.warn('   ⚠ PreTokenizer returned 0 bytes — falling back to byte-level');
             const bytes = new TextEncoder().encode(input);
             return { symbolData: bytesToSymbols(bytes), wordStarts: null };

@@ -74,8 +74,8 @@ fn flat_id(gid: vec3<u32>, nwg: vec3<u32>) -> u32 {
 }
 
 // Local hash table constants for bpe_pair_count_b
-const LOCAL_TABLE_SIZE: u32 = 512u;
-const LOCAL_TABLE_MASK: u32 = 511u;  // power-of-2 modulo
+const LOCAL_TABLE_SIZE: u32 = 1024u;
+const LOCAL_TABLE_MASK: u32 = 1023u;  // power-of-2 modulo
 const LOCAL_MAX_PROBE: u32 = 64u;
 
 /// Deterministic comparison: higher count wins; ties broken by smaller pair_id.
@@ -370,8 +370,8 @@ fn bpe_setup_merge(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(2) var<storage, read_write> pair_ids: array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read> state: IterState;
 
-var<workgroup> local_ids: array<atomic<u32>, 512>;
-var<workgroup> local_counts: array<atomic<u32>, 512>;
+var<workgroup> local_ids: array<atomic<u32>, 1024>;
+var<workgroup> local_counts: array<atomic<u32>, 1024>;
 
 @compute @workgroup_size(256)
 fn bpe_pair_count_b(
@@ -379,10 +379,11 @@ fn bpe_pair_count_b(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(num_workgroups) nwg: vec3<u32>
 ) {
-    atomicStore(&local_ids[lid.x], 0u);
-    atomicStore(&local_counts[lid.x], 0u);
-    atomicStore(&local_ids[lid.x + 256u], 0u);
-    atomicStore(&local_counts[lid.x + 256u], 0u);
+    // Clear 1024 entries with 256 threads (4 entries/thread)
+    for (var s: u32 = 0u; s < LOCAL_TABLE_SIZE; s += WORKGROUP_SIZE) {
+        atomicStore(&local_ids[lid.x + s], 0u);
+        atomicStore(&local_counts[lid.x + s], 0u);
+    }
     workgroupBarrier();
 
     if (state.early_stop != 0u) { return; }

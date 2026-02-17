@@ -4,7 +4,7 @@ import { StatusManager } from './status-manager.js';
 import { FileManager } from './file-manager.js';
 import { UIManager } from './ui-manager.js';
 import { TrainingManager } from './training-manager.js';
-import { TokenizerManager } from '../bpe/tokenizer-manager.js';
+import { TokenizerManager } from '../bpe/tokenizer/tokenizer-manager.js';
 import { FileInputController } from './file-input-controller.js';
 import { VocabLoaderController } from './vocab-loader-controller.js';
 import { EncoderController } from './encoder-controller.js';
