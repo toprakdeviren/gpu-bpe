@@ -7,18 +7,22 @@
  * at those markers and compiles each kernel as a separate GPUShaderModule,
  * prepending the shared utility section (everything before the first marker).
  *
- * Kernels (11):
- *   1. bpe_word_boundary         — GPU pre-tokenization (word boundary detection)
- *   2. bpe_clear_table           — Hash table reset
- *   3. bpe_find_max_pair         — Block-level max reduction
- *   4. bpe_find_max_pair_final   — Final max reduction (single workgroup)
- *   5. bpe_setup_merge           — GPU-driven merge orchestrator
- *   6. bpe_pair_count_b          — Batched two-level pair counting
- *   7. bpe_merge_b               — Fused fill_valid + pair merge (race-free self-validity)
- *   8. bpe_prefix_sum_reduce_b   — Batched prefix sum reduce
- *   9. bpe_prefix_sum_scan_blocks_b — Block scan (stages total to IterState._pad1)
- *  10. bpe_finalize_compact_b    — Fused Blelloch scan + scatter
- *  11. bpe_update_count          — Symbol count update + indirect dispatch (reads _pad1)
+ * Kernels (10):
+ *   1. bpe_word_boundary              — GPU pre-tokenization (word boundary detection)
+ *   2. bpe_clear_table                — Hash table reset
+ *   3. bpe_find_max_pair4             — Block-level max reduction (4 elem/thread, deterministic)
+ *   4. bpe_find_max_pair_final_det    — Final max reduction (deterministic tie-breaking)
+ *   5. bpe_setup_merge                — GPU-driven merge orchestrator
+ *   6. bpe_pair_count_b               — Batched two-level pair counting
+ *   7. bpe_merge_reduce_b             — FUSED merge + prefix_sum_reduce (saves 1 dispatch + N×4B)
+ *   8. bpe_prefix_sum_scan_blocks_par — Parallel Blelloch scan + update_count absorbed
+ *   9. bpe_finalize_compact_b         — Fused Blelloch scan + scatter
+ *  10. bpe_prefix_sum_scan_blocks_b   — Sequential fallback for >256 blocks
+ *
+ * Pipeline (8 dispatches/iteration, down from 10):
+ *   clear_table → pair_count → find_max4 → find_max_final_det → setup_merge
+ *   → merge_reduce (FUSED) → scan_blocks_par (PARALLEL + update_count)
+ *   → finalize_compact
  */
 
 // ════════════════════════════════════════════════════════════
@@ -73,6 +77,12 @@ fn flat_id(gid: vec3<u32>, nwg: vec3<u32>) -> u32 {
 const LOCAL_TABLE_SIZE: u32 = 512u;
 const LOCAL_TABLE_MASK: u32 = 511u;  // power-of-2 modulo
 const LOCAL_MAX_PROBE: u32 = 64u;
+
+/// Deterministic comparison: higher count wins; ties broken by smaller pair_id.
+/// Ensures identical vocabulary output regardless of GPU scheduling order.
+fn is_better(count_new: u32, pair_new: u32, count_old: u32, pair_old: u32) -> bool {
+    return count_new > count_old || (count_new == count_old && pair_new < pair_old);
+}
 
 // --- KERNEL: bpe_word_boundary ---
 //
@@ -191,7 +201,18 @@ fn bpe_clear_table(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_w
     pair_ids[id] = 0u;
 }
 
-// --- KERNEL: bpe_find_max_pair ---
+// --- KERNEL: bpe_find_max_pair4 ---
+//
+// 4 elements/thread max reduction with deterministic tie-breaking.
+// Each thread loads 4 hash table entries, performs thread-local max,
+// then enters shared-memory reduction.
+//
+// Benefits:
+//   - 4× fewer workgroups → 4× fewer block_max entries
+//   - Deterministic: same count → smaller pair_id wins (reproducible)
+//   - Same occupancy (256 threads/wg), better utilization
+//
+// Coverage: 256 threads × 4 elements = 1024 entries/workgroup.
 
 struct FindMaxParams { table_size: u32, _pad: u32 }
 
@@ -205,28 +226,57 @@ var<workgroup> sh_c: array<u32, 256>;
 var<workgroup> sh_p: array<u32, 256>;
 
 @compute @workgroup_size(256)
-fn bpe_find_max_pair(
+fn bpe_find_max_pair4(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) tgid: vec3<u32>,
     @builtin(num_workgroups) nwg: vec3<u32>
 ) {
-    let fid = flat_id(gid, nwg);
     let block_idx = tgid.x + tgid.y * nwg.x;
-    var c: u32 = 0u; var p: u32 = 0u;
-    if (fid < params.table_size) { c = pair_counts[fid]; p = pair_ids[fid]; }
-    sh_c[lid.x] = c; sh_p[lid.x] = p;
+
+    // ── Thread-local max over 4 elements ──
+    let base = (gid.x + gid.y * nwg.x * WORKGROUP_SIZE) * 4u;
+    var best_c: u32 = 0u;
+    var best_p: u32 = 0u;
+
+    for (var e: u32 = 0u; e < 4u; e++) {
+        let idx = base + e;
+        if (idx < params.table_size) {
+            let c = pair_counts[idx];
+            let p = pair_ids[idx];
+            if (is_better(c, p, best_c, best_p)) {
+                best_c = c;
+                best_p = p;
+            }
+        }
+    }
+
+    sh_c[lid.x] = best_c;
+    sh_p[lid.x] = best_p;
     workgroupBarrier();
+
+    // ── Shared-memory reduction with deterministic tie-breaking ──
     for (var s: u32 = 128u; s > 0u; s >>= 1u) {
-        if (lid.x < s && sh_c[lid.x + s] > sh_c[lid.x]) {
-            sh_c[lid.x] = sh_c[lid.x + s]; sh_p[lid.x] = sh_p[lid.x + s];
+        if (lid.x < s) {
+            if (is_better(sh_c[lid.x + s], sh_p[lid.x + s],
+                          sh_c[lid.x], sh_p[lid.x])) {
+                sh_c[lid.x] = sh_c[lid.x + s];
+                sh_p[lid.x] = sh_p[lid.x + s];
+            }
         }
         workgroupBarrier();
     }
-    if (lid.x == 0u) { block_max_counts[block_idx] = sh_c[0]; block_max_pair_ids[block_idx] = sh_p[0]; }
+
+    if (lid.x == 0u) {
+        block_max_counts[block_idx] = sh_c[0];
+        block_max_pair_ids[block_idx] = sh_p[0];
+    }
 }
 
-// --- KERNEL: bpe_find_max_pair_final ---
+// --- KERNEL: bpe_find_max_pair_final_det ---
+//
+// Final max reduction with deterministic tie-breaking.
+// Same count → smaller pair_id wins → reproducible vocabulary.
 
 struct FinalParams { block_count: u32, _pad: u32 }
 
@@ -240,19 +290,27 @@ var<workgroup> sh_c: array<u32, 256>;
 var<workgroup> sh_p: array<u32, 256>;
 
 @compute @workgroup_size(256)
-fn bpe_find_max_pair_final(@builtin(local_invocation_id) lid: vec3<u32>) {
+fn bpe_find_max_pair_final_det(@builtin(local_invocation_id) lid: vec3<u32>) {
     var lm: u32 = 0u; var lp: u32 = 0u;
     var i: u32 = lid.x;
     while (i < params.block_count) {
         let c = block_max_counts[i];
-        if (c > lm) { lm = c; lp = block_max_pair_ids[i]; }
+        let p = block_max_pair_ids[i];
+        if (is_better(c, p, lm, lp)) {
+            lm = c;
+            lp = p;
+        }
         i += WORKGROUP_SIZE;
     }
     sh_c[lid.x] = lm; sh_p[lid.x] = lp;
     workgroupBarrier();
     for (var s: u32 = 128u; s > 0u; s >>= 1u) {
-        if (lid.x < s && sh_c[lid.x + s] > sh_c[lid.x]) {
-            sh_c[lid.x] = sh_c[lid.x + s]; sh_p[lid.x] = sh_p[lid.x + s];
+        if (lid.x < s) {
+            if (is_better(sh_c[lid.x + s], sh_p[lid.x + s],
+                          sh_c[lid.x], sh_p[lid.x])) {
+                sh_c[lid.x] = sh_c[lid.x + s];
+                sh_p[lid.x] = sh_p[lid.x + s];
+            }
         }
         workgroupBarrier();
     }
@@ -371,88 +429,208 @@ fn bpe_pair_count_b(
     }
 }
 
-// --- KERNEL: bpe_merge_b ---
+// --- KERNEL: bpe_merge_reduce_b ---
 //
-// Fused fill_valid + merge: each thread writes its OWN valid_mask[id].
-// A thread is invalid (valid=0) only if it is the B-side of a matching pair.
-// The A-side thread writes the merged symbol. No cross-thread valid_mask
-// writes — completely race-free without global barriers.
+// FUSED merge + prefix_sum_reduce: eliminates 1 dispatch + N×4 byte global read.
+//
+// Phase 1: Each thread performs merge logic (A-side write, B-side validity).
+//          The valid bit stays in register — NO separate valid_mask read pass
+//          needed for the reduction.
+// Phase 2: Workgroup-local sum reduction of valid bits → block_sums.
+//
+// valid_mask is still WRITTEN because finalize_compact_b reads it.
+//
+// Bindings (superset of original merge + reduce):
+//   0: symbols    (read_write) — merge reads neighbors, A-side writes merged symbol
+//   1: valid_mask (read_write) — written for finalize_compact to consume
+//   2: block_sums (read_write) — workgroup reduction output
+//   3: state      (read)       — IterState with symbol_a, symbol_b, new_symbol, count
 
 @group(0) @binding(0) var<storage, read_write> symbols: array<u32>;
 @group(0) @binding(1) var<storage, read_write> valid_mask: array<u32>;
-@group(0) @binding(2) var<storage, read> state: IterState;
+@group(0) @binding(2) var<storage, read_write> block_sums: array<u32>;
+@group(0) @binding(3) var<storage, read> state: IterState;
+
+var<workgroup> sh_reduce: array<u32, 256>;
 
 @compute @workgroup_size(256)
-fn bpe_merge_b(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    if (state.early_stop != 0u) { return; }
-    let id = flat_id(gid, nwg);
-    if (id >= state.symbol_count) { return; }
-
-    let raw = symbols[id];
-
-    // ── A-side: check if (id, id+1) is the winning pair → write merged symbol ──
-    if (id + 1u < state.symbol_count) {
-        let raw_b = symbols[id + 1u];
-        if ((raw_b & WORD_START_BIT) == 0u
-            && (raw & TOKEN_MASK) == state.symbol_a
-            && (raw_b & TOKEN_MASK) == state.symbol_b) {
-            let flag = raw & WORD_START_BIT;
-            symbols[id] = state.new_symbol | flag;
-        }
-    }
-
-    // ── Self-validity: am I the B-side of a merge? ──
-    // Check if (id-1, id) matches the winning pair → I'm consumed → valid=0
-    var valid: u32 = 1u;
-    if (id > 0u) {
-        let raw_prev = symbols[id - 1u];
-        if ((raw & WORD_START_BIT) == 0u
-            && (raw_prev & TOKEN_MASK) == state.symbol_a
-            && (raw & TOKEN_MASK) == state.symbol_b) {
-            valid = 0u;
-        }
-    }
-    valid_mask[id] = valid;
-}
-
-// --- KERNEL: bpe_prefix_sum_reduce_b ---
-
-@group(0) @binding(0) var<storage, read> valid_mask: array<u32>;
-@group(0) @binding(1) var<storage, read_write> block_sums: array<u32>;
-@group(0) @binding(2) var<storage, read> state: IterState;
-
-var<workgroup> sh_data: array<u32, 256>;
-
-@compute @workgroup_size(256)
-fn bpe_prefix_sum_reduce_b(
+fn bpe_merge_reduce_b(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) tgid: vec3<u32>,
     @builtin(num_workgroups) nwg: vec3<u32>
 ) {
-    let fid = flat_id(gid, nwg);
+    // NOTE: Cannot early-return before workgroupBarrier() — WGSL requires
+    // uniform control flow at barriers. Use guard flag instead.
+    let stopped = state.early_stop != 0u;
+
+    let id = flat_id(gid, nwg);
     let block_idx = tgid.x + tgid.y * nwg.x;
-    var v: u32 = 0u;
-    if (fid < state.symbol_count) { v = valid_mask[fid] & 1u; }
-    sh_data[lid.x] = v;
+
+    // ── Phase 1: Merge logic (race-free pattern) ──
+
+    var valid: u32 = 0u;  // default 0 for out-of-bounds or stopped threads
+
+    if (!stopped && id < state.symbol_count) {
+        // Read ALL inputs BEFORE any writes — prevents cross-workgroup race
+        let raw      = symbols[id];
+        let raw_prev = select(0u, symbols[id - 1u], id > 0u);
+        let raw_next = select(0u, symbols[id + 1u], id + 1u < state.symbol_count);
+
+        // A-side: write merged symbol if (id, id+1) matches the winning pair
+        if (id + 1u < state.symbol_count
+            && (raw_next & WORD_START_BIT) == 0u
+            && (raw & TOKEN_MASK) == state.symbol_a
+            && (raw_next & TOKEN_MASK) == state.symbol_b) {
+            let flag = raw & WORD_START_BIT;
+            symbols[id] = state.new_symbol | flag;
+        }
+
+        // B-side self-validity: uses pre-read raw_prev (immune to A-side overwrites)
+        valid = 1u;
+        if (id > 0u
+            && (raw & WORD_START_BIT) == 0u
+            && (raw_prev & TOKEN_MASK) == state.symbol_a
+            && (raw & TOKEN_MASK) == state.symbol_b) {
+            valid = 0u;
+        }
+
+        // Write valid_mask for finalize_compact
+        valid_mask[id] = valid;
+    }
+
+    // ── Phase 2: Workgroup reduction (replaces bpe_prefix_sum_reduce_b) ──
+    //    valid bit is already in register — NO global read of valid_mask.
+    //    All threads (including stopped ones) participate in barriers.
+
+    sh_reduce[lid.x] = valid;
     workgroupBarrier();
+
     for (var s: u32 = 128u; s > 0u; s >>= 1u) {
-        if (lid.x < s) { sh_data[lid.x] += sh_data[lid.x + s]; }
+        if (lid.x < s) {
+            sh_reduce[lid.x] += sh_reduce[lid.x + s];
+        }
         workgroupBarrier();
     }
-    if (lid.x == 0u) { block_sums[block_idx] = sh_data[0]; }
+
+    if (lid.x == 0u && !stopped) {
+        block_sums[block_idx] = sh_reduce[0];
+    }
+}
+
+// --- KERNEL: bpe_prefix_sum_scan_blocks_par ---
+//
+// Parallel Blelloch exclusive prefix scan over block_sums (256 threads).
+// Replaces the sequential single-thread scan with O(log N) parallel work.
+//
+// Also absorbs bpe_update_count:
+//   - Writes new symbol_count to state.symbol_count
+//   - Computes indirect dispatch parameters
+//
+// Eliminates 1 dispatch (update_count) + replaces O(N/256) sequential→O(log N).
+//
+// Limitation: Handles up to 256 blocks (= 65,536 symbols).
+// For larger inputs, the JS host uses the sequential fallback
+// (bpe_prefix_sum_scan_blocks_b) which handles unlimited blocks.
+//
+// Bindings:
+//   0: block_sums (read_write) — per-block totals → exclusive prefix sums
+//   1: state      (read_write) — IterState (writes symbol_count)
+//   2: indirect   (read_write) — indirect dispatch buffer [wgX, wgY, wgZ]
+
+@group(0) @binding(0) var<storage, read_write> block_sums: array<u32>;
+@group(0) @binding(1) var<storage, read_write> state: IterState;
+@group(0) @binding(2) var<storage, read_write> indirect: array<u32>;
+
+var<workgroup> sh_scan: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn bpe_prefix_sum_scan_blocks_par(
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    // NOTE: Cannot early-return before workgroupBarrier() — WGSL requires
+    // uniform control flow. Use guard flag; all threads still hit barriers.
+    let stopped = state.early_stop != 0u;
+
+    let block_count = select(
+        (state.symbol_count + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE,
+        0u,
+        stopped
+    );
+
+    // ── Load: each thread handles one block_sum ──
+    var val: u32 = 0u;
+    if (!stopped && lid.x < block_count) {
+        val = block_sums[lid.x];
+    }
+    sh_scan[lid.x] = val;
+    workgroupBarrier();
+
+    // ── Blelloch up-sweep (reduce) ──
+    for (var d: u32 = 1u; d < WORKGROUP_SIZE; d <<= 1u) {
+        let idx = (lid.x + 1u) * (d << 1u) - 1u;
+        if (idx < WORKGROUP_SIZE) {
+            sh_scan[idx] += sh_scan[idx - d];
+        }
+        workgroupBarrier();
+    }
+
+    // Save total before clearing root
+    var total: u32 = 0u;
+    if (lid.x == 0u) {
+        total = sh_scan[WORKGROUP_SIZE - 1u];
+        sh_scan[WORKGROUP_SIZE - 1u] = 0u;
+    }
+    workgroupBarrier();
+
+    // ── Blelloch down-sweep ──
+    for (var d: u32 = WORKGROUP_SIZE >> 1u; d > 0u; d >>= 1u) {
+        let idx = (lid.x + 1u) * (d << 1u) - 1u;
+        if (idx < WORKGROUP_SIZE) {
+            let t = sh_scan[idx - d];
+            sh_scan[idx - d] = sh_scan[idx];
+            sh_scan[idx] += t;
+        }
+        workgroupBarrier();
+    }
+
+    // ── Write back + update_count (guarded by stopped flag) ──
+    if (!stopped && lid.x < block_count) {
+        block_sums[lid.x] = sh_scan[lid.x];
+    }
+
+    // Absorb update_count logic (thread 0 only)
+    if (lid.x == 0u && !stopped) {
+        state._pad1 = total;
+        state.symbol_count = total;
+
+        let total_wg = (total + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        if (total_wg <= MAX_WG_DIM) {
+            indirect[0] = max(total_wg, 1u);
+            indirect[1] = 1u;
+        } else {
+            indirect[0] = MAX_WG_DIM;
+            indirect[1] = (total_wg + MAX_WG_DIM - 1u) / MAX_WG_DIM;
+        }
+        indirect[2] = 1u;
+    }
 }
 
 // --- KERNEL: bpe_prefix_sum_scan_blocks_b ---
 //
-// Sequential exclusive prefix scan over block_sums (single thread).
-// Writes total valid count to state._pad1 (staging field) instead of a
-// separate buffer — eliminates the total_valid buffer entirely.
-// Cannot update state.symbol_count here because finalize_compact_b
-// runs next and needs the OLD symbol_count.
+// Sequential fallback for >256 blocks (>65,536 symbols).
+// Single-thread exclusive prefix scan + stages total to state._pad1.
+// The JS host calls update_count_logic separately via scan_blocks_par
+// when using this path, OR this kernel can be followed by a simple
+// update_count dispatch.
+//
+// Note: This kernel does NOT update symbol_count or indirect dispatch.
+// When used as fallback, the JS host must call bpe_prefix_sum_scan_blocks_par
+// or handle the update separately.
 
 @group(0) @binding(0) var<storage, read_write> block_sums: array<u32>;
 @group(0) @binding(1) var<storage, read_write> state: IterState;
+@group(0) @binding(2) var<storage, read_write> indirect: array<u32>;
 
 @compute @workgroup_size(1)
 fn bpe_prefix_sum_scan_blocks_b(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -466,8 +644,20 @@ fn bpe_prefix_sum_scan_blocks_b(@builtin(global_invocation_id) gid: vec3<u32>) {
         block_sums[i] = sum;
         sum += v;
     }
-    // Stage new count in _pad1 — consumed by bpe_update_count after compact
+
+    // Stage new count + update symbol_count + indirect dispatch
     state._pad1 = sum;
+    state.symbol_count = sum;
+
+    let total_wg = (sum + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+    if (total_wg <= MAX_WG_DIM) {
+        indirect[0] = max(total_wg, 1u);
+        indirect[1] = 1u;
+    } else {
+        indirect[0] = MAX_WG_DIM;
+        indirect[1] = (total_wg + MAX_WG_DIM - 1u) / MAX_WG_DIM;
+    }
+    indirect[2] = 1u;
 }
 
 // --- KERNEL: bpe_finalize_compact_b ---
@@ -537,34 +727,4 @@ fn bpe_finalize_compact_b(
         let dest = block_sums[block_idx] + sh_data[lid.x];
         output_symbols[dest] = input_symbols[fid];
     }
-}
-
-// --- KERNEL: bpe_update_count ---
-//
-// After compact: reads new symbol count from state._pad1 (staged by
-// scan_blocks), updates symbol_count, and computes indirect dispatch
-// params for the next iteration. Eliminates the total_valid buffer —
-// the value is passed through IterState padding.
-//
-// Indirect buffer layout: [wgX, wgY, wgZ] (3 × u32)
-
-@group(0) @binding(0) var<storage, read_write> state: IterState;
-@group(0) @binding(1) var<storage, read_write> indirect: array<u32>;
-
-@compute @workgroup_size(1)
-fn bpe_update_count(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (state.early_stop != 0u) { return; }
-
-    let new_count = state._pad1;
-    state.symbol_count = new_count;
-
-    let total_wg = (new_count + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
-    if (total_wg <= MAX_WG_DIM) {
-        indirect[0] = max(total_wg, 1u);
-        indirect[1] = 1u;
-    } else {
-        indirect[0] = MAX_WG_DIM;
-        indirect[1] = (total_wg + MAX_WG_DIM - 1u) / MAX_WG_DIM;
-    }
-    indirect[2] = 1u;
 }

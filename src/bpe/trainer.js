@@ -233,20 +233,23 @@ class Vocab {
  */
 function allocTrainingBuffers(device, maxSymbols) {
     const maxBlocks = Math.ceil(maxSymbols / WORKGROUP_SIZE);
-    const findMaxBlocks = Math.ceil(TABLE_SIZE / 256);
+    // find_max_pair4: 4 elements/thread × 256 threads = 1024 entries/workgroup
+    const findMaxBlocks = Math.ceil(TABLE_SIZE / (256 * 4));
+    // Parallel scan handles up to 256 blocks (65,536 symbols); above that → sequential fallback
+    const useParallelScan = maxBlocks <= 256;
 
     return {
         // Hash table
         pairCounts: allocBuffer(device, TABLE_SIZE * 4, BUFFER_USAGE.STORAGE_SRC),
         pairIds: allocBuffer(device, TABLE_SIZE * 4, BUFFER_USAGE.STORAGE_SRC),
 
-        // FindMax reduction
+        // FindMax reduction (4× fewer blocks thanks to find_max_pair4)
         blockMaxCounts: allocBuffer(device, findMaxBlocks * 4, GPUBufferUsage.STORAGE),
         blockMaxPairIds: allocBuffer(device, findMaxBlocks * 4, GPUBufferUsage.STORAGE),
         maxCount: allocBuffer(device, 4, BUFFER_USAGE.STORAGE_SRC),
         maxPairId: allocBuffer(device, 4, BUFFER_USAGE.STORAGE_SRC),
 
-        // Compaction
+        // Compaction (merge_reduce writes valid_mask + block_sums in one pass)
         validMask: allocBuffer(device, maxSymbols * 4, GPUBufferUsage.STORAGE),
         blockSums: allocBuffer(device, maxBlocks * 4, GPUBufferUsage.STORAGE),
         compact: allocBuffer(device, maxSymbols * 4, BUFFER_USAGE.STORAGE_SRC),
@@ -256,7 +259,7 @@ function allocTrainingBuffers(device, maxSymbols) {
         mergeLog: allocBuffer(device, BATCH_SIZE * MERGE_LOG_STRIDE * 4, BUFFER_USAGE.STORAGE_SRC),
 
         // Indirect dispatch buffer (3 × u32: wgX, wgY, wgZ)
-        // Written by bpe_update_count kernel, read by dispatchWorkgroupsIndirect
+        // Written by scan_blocks kernel, read by dispatchWorkgroupsIndirect
         indirectDispatch: allocBuffer(device, 12,
             GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST),
 
@@ -264,7 +267,7 @@ function allocTrainingBuffers(device, maxSymbols) {
         readbackState: allocBuffer(device, ITER_STATE_SIZE, BUFFER_USAGE.READBACK),
         readbackLog: allocBuffer(device, BATCH_SIZE * MERGE_LOG_STRIDE * 4, BUFFER_USAGE.READBACK),
 
-        // Uniform param buffers (allocated once, reused across bind group recreations)
+        // Uniform param buffers
         clearTableParam: uploadBuffer(device, new Uint32Array([TABLE_SIZE, 0]), GPUBufferUsage.UNIFORM),
         findMaxParam1: uploadBuffer(device, new Uint32Array([TABLE_SIZE, 0]), GPUBufferUsage.UNIFORM),
         findMaxParam2: uploadBuffer(device, new Uint32Array([findMaxBlocks, 0]), GPUBufferUsage.UNIFORM),
@@ -273,6 +276,7 @@ function allocTrainingBuffers(device, maxSymbols) {
         maxBlocks,
         findMaxBlocks,
         maxSymbols,
+        useParallelScan,
     };
 }
 
@@ -323,11 +327,11 @@ function buildBindGroups(device, pipelines, symbolBufA, symbolBufB, tb) {
             symbolBufB, tb.pairCounts, tb.pairIds, tb.iterState,
         ]),
 
-        // Two-pass findMax
-        findMax1: bg(p.bpe_find_max_pair, [
+        // Two-pass findMax (4 elem/thread, deterministic tie-breaking)
+        findMax1: bg(p.bpe_find_max_pair4, [
             tb.pairCounts, tb.pairIds, tb.blockMaxCounts, tb.blockMaxPairIds, tb.findMaxParam1,
         ]),
-        findMax2: bg(p.bpe_find_max_pair_final, [
+        findMax2: bg(p.bpe_find_max_pair_final_det, [
             tb.blockMaxCounts, tb.blockMaxPairIds, tb.maxCount, tb.maxPairId, tb.findMaxParam2,
         ]),
 
@@ -336,20 +340,25 @@ function buildBindGroups(device, pipelines, symbolBufA, symbolBufB, tb) {
             tb.maxCount, tb.maxPairId, tb.iterState, tb.mergeLog,
         ]),
 
-        // Ping-pong merge
-        mergeA: bg(p.bpe_merge_b, [
-            symbolBufA, tb.validMask, tb.iterState,
+        // FUSED merge + reduce (ping-pong)
+        // Bindings: symbols, valid_mask, block_sums, state
+        mergeReduceA: bg(p.bpe_merge_reduce_b, [
+            symbolBufA, tb.validMask, tb.blockSums, tb.iterState,
         ]),
-        mergeB: bg(p.bpe_merge_b, [
-            symbolBufB, tb.validMask, tb.iterState,
+        mergeReduceB: bg(p.bpe_merge_reduce_b, [
+            symbolBufB, tb.validMask, tb.blockSums, tb.iterState,
         ]),
 
-        // Two-phase prefix sum (reduce + scan)
-        prefixReduce: bg(p.bpe_prefix_sum_reduce_b, [
-            tb.validMask, tb.blockSums, tb.iterState,
+        // Parallel scan + update_count (primary path, ≤256 blocks)
+        // Bindings: block_sums, state, indirect
+        scanBlocksPar: bg(p.bpe_prefix_sum_scan_blocks_par, [
+            tb.blockSums, tb.iterState, tb.indirectDispatch,
         ]),
-        prefixScan: bg(p.bpe_prefix_sum_scan_blocks_b, [
-            tb.blockSums, tb.iterState,
+
+        // Sequential scan fallback (>256 blocks)
+        // Same binding layout: block_sums, state, indirect
+        scanBlocksSeq: bg(p.bpe_prefix_sum_scan_blocks_b, [
+            tb.blockSums, tb.iterState, tb.indirectDispatch,
         ]),
 
         // Fused finalize + compact (prefix_sum stays in registers)
@@ -359,11 +368,6 @@ function buildBindGroups(device, pipelines, symbolBufA, symbolBufB, tb) {
         finalizeCompactBA: bg(p.bpe_finalize_compact_b, [
             tb.validMask, tb.blockSums, symbolBufB, symbolBufA, tb.iterState,
         ]),
-
-        // Update count + indirect dispatch (reads staged total from IterState._pad1)
-        updateCount: bg(p.bpe_update_count, [
-            tb.iterState, tb.indirectDispatch,
-        ]),
     };
 }
 
@@ -371,14 +375,24 @@ function buildBindGroups(device, pipelines, symbolBufA, symbolBufB, tb) {
 
 /**
  * Encode one batch of BPE merge iterations into a command encoder.
+ *
+ * Optimized pipeline (8 dispatches/iteration, down from 10):
+ *   clear → count → findMax4 → findMaxFinal → setupMerge
+ *   → mergeReduce (FUSED) → scanBlocksPar → finalizeCompact
  */
-function encodeBatch(cmd, pipelines, bg, batchMerges, maxDispatch, maxBlocks, findMaxBlocks, indirectBuf) {
+function encodeBatch(cmd, pipelines, bg, batchMerges, maxDispatch, maxBlocks, findMaxBlocks, indirectBuf, useParallelScan) {
     const p = pipelines;
+
+    // Choose scan kernel + bind group based on block count
+    const scanPipeline = useParallelScan
+        ? p.bpe_prefix_sum_scan_blocks_par
+        : p.bpe_prefix_sum_scan_blocks_b;
+    const scanBG = useParallelScan ? bg.scanBlocksPar : bg.scanBlocksSeq;
 
     for (let i = 0; i < batchMerges; i++) {
         const even = (i % 2 === 0);
 
-        // Phase A: clear → count → findMax → setupMerge
+        // Phase A: clear → count → findMax4 → findMaxFinal → setupMerge
         encodePass(cmd, p.bpe_clear_table, bg.clearTable,
             Math.ceil(TABLE_SIZE / WORKGROUP_SIZE));
 
@@ -391,28 +405,25 @@ function encodeBatch(cmd, pipelines, bg, batchMerges, maxDispatch, maxBlocks, fi
                 even ? bg.pairCountA : bg.pairCountB, indirectBuf);
         }
 
-        encodePass(cmd, p.bpe_find_max_pair, bg.findMax1, findMaxBlocks);
-        encodePass(cmd, p.bpe_find_max_pair_final, bg.findMax2, 1);
+        encodePass(cmd, p.bpe_find_max_pair4, bg.findMax1, findMaxBlocks);
+        encodePass(cmd, p.bpe_find_max_pair_final_det, bg.findMax2, 1);
         encodePass(cmd, p.bpe_setup_merge, bg.setupMerge, 1);
 
-        // Phase B: merge → prefixReduce → scan → finalizeCompact → updateCount
-        // All dynamic kernels use indirect dispatch (except first iteration)
+        // Phase B: mergeReduce (FUSED) → scanBlocks → finalizeCompact
+        //          8 dispatches total (was 10)
         if (i === 0) {
-            encodePass(cmd, p.bpe_merge_b, even ? bg.mergeA : bg.mergeB, maxDispatch);
-            encodePass(cmd, p.bpe_prefix_sum_reduce_b, bg.prefixReduce, maxBlocks);
-            encodePass(cmd, p.bpe_prefix_sum_scan_blocks_b, bg.prefixScan, 1);
+            encodePass(cmd, p.bpe_merge_reduce_b,
+                even ? bg.mergeReduceA : bg.mergeReduceB, maxDispatch);
+            encodePass(cmd, scanPipeline, scanBG, useParallelScan ? 1 : 1);
             encodePass(cmd, p.bpe_finalize_compact_b,
                 even ? bg.finalizeCompactAB : bg.finalizeCompactBA, maxDispatch);
         } else {
-            encodeIndirectPass(cmd, p.bpe_merge_b, even ? bg.mergeA : bg.mergeB, indirectBuf);
-            encodeIndirectPass(cmd, p.bpe_prefix_sum_reduce_b, bg.prefixReduce, indirectBuf);
-            encodePass(cmd, p.bpe_prefix_sum_scan_blocks_b, bg.prefixScan, 1);
+            encodeIndirectPass(cmd, p.bpe_merge_reduce_b,
+                even ? bg.mergeReduceA : bg.mergeReduceB, indirectBuf);
+            encodePass(cmd, scanPipeline, scanBG, 1);
             encodeIndirectPass(cmd, p.bpe_finalize_compact_b,
                 even ? bg.finalizeCompactAB : bg.finalizeCompactBA, indirectBuf);
         }
-
-        // Update count + write next indirect dispatch params
-        encodePass(cmd, p.bpe_update_count, bg.updateCount, 1);
     }
 }
 
@@ -632,7 +643,7 @@ export class BPETrainer {
             const cmd = device.createCommandEncoder();
 
             encodeBatch(cmd, pipelines, bg, batchMerges,
-                maxDispatch, tb.maxBlocks, tb.findMaxBlocks, tb.indirectDispatch);
+                maxDispatch, tb.maxBlocks, tb.findMaxBlocks, tb.indirectDispatch, tb.useParallelScan);
 
             // Copy state + merge log for readback
             cmd.copyBufferToBuffer(tb.iterState, 0, tb.readbackState, 0, ITER_STATE_SIZE);
